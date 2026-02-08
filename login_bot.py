@@ -47,6 +47,16 @@ logger.info(f"Sessions Dir: {SESSIONS_DIR}")
 # Track ongoing login sessions
 login_sessions = {}
 
+# Lock per session to prevent SQLite "database is locked" errors
+# Key: phone number, Value: asyncio.Lock
+session_locks = {}
+
+def get_session_lock(phone: str) -> asyncio.Lock:
+    """Gets or creates a lock for a specific phone's session."""
+    if phone not in session_locks:
+        session_locks[phone] = asyncio.Lock()
+    return session_locks[phone]
+
 # Track messages for auto-deletion: {(chat_id, msg_id): delete_at_timestamp}
 messages_to_delete = {}
 
@@ -239,59 +249,63 @@ async def main():
         
         # Create client for this user
         session_file = os.path.join(SESSIONS_DIR, f"account_{phone.replace('+', '')}")
-        session.client = TelegramClient(session_file, API_ID, API_HASH)
         
-        try:
-            await session.client.connect()
+        # Use lock to prevent concurrent SQLite access (Docker volumes can be slow)
+        lock = get_session_lock(phone)
+        async with lock:
+            session.client = TelegramClient(session_file, API_ID, API_HASH)
             
-            # Check if already authorized
-            if await session.client.is_user_authorized():
-                me = await session.client.get_me()
-                await save_account(session, me)
+            try:
+                await session.client.connect()
                 
+                # Check if already authorized
+                if await session.client.is_user_authorized():
+                    me = await session.client.get_me()
+                    await save_account(session, me)
+                    
+                    await send_and_track(
+                        bot, event,
+                        f"✅ **Already logged in!**\n\n"
+                        f"👤 Name: {me.first_name} {me.last_name or ''}\n"
+                        f"📱 Phone: {me.phone}\n"
+                        f"🆔 ID: {me.id}\n\n"
+                        f"Your account is now registered for scanning."
+                    )
+                    del login_sessions[user_id]
+                    return
+                
+                # Request verification code
+                await send_and_track(bot, event, "📤 Sending verification code to your Telegram...")
+                
+                result = await session.client.send_code_request(phone)
+                session.phone_code_hash = result.phone_code_hash
+                session.state = LoginState.WAITING_CODE
+                
+                # Send instruction (no tracking needed for this follow-up)
+                reply = await event.respond(
+                    "✅ **Code sent!**\n\n"
+                    "Telegram might block the sign-in if you forward or copy-paste the code directly.\n\n"
+                    "**Please type the code manually with spaces:**\n"
+                    "Example: `1 2 3 4 5`\n\n"
+                    "(I will automatically remove the spaces)"
+                )
+                await schedule_delete(bot, event.chat_id, reply.id)
+                
+            except FloodWaitError as e:
                 await send_and_track(
                     bot, event,
-                    f"✅ **Already logged in!**\n\n"
-                    f"👤 Name: {me.first_name} {me.last_name or ''}\n"
-                    f"📱 Phone: {me.phone}\n"
-                    f"🆔 ID: {me.id}\n\n"
-                    f"Your account is now registered for scanning."
+                    f"⚠️ Too many attempts. Please wait {e.seconds} seconds and try again."
                 )
+                if session.client:
+                    await session.client.disconnect()
                 del login_sessions[user_id]
-                return
-            
-            # Request verification code
-            await send_and_track(bot, event, "📤 Sending verification code to your Telegram...")
-            
-            result = await session.client.send_code_request(phone)
-            session.phone_code_hash = result.phone_code_hash
-            session.state = LoginState.WAITING_CODE
-            
-            # Send instruction (no tracking needed for this follow-up)
-            reply = await event.respond(
-                "✅ **Code sent!**\n\n"
-                "Telegram might block the sign-in if you forward or copy-paste the code directly.\n\n"
-                "**Please type the code manually with spaces:**\n"
-                "Example: `1 2 3 4 5`\n\n"
-                "(I will automatically remove the spaces)"
-            )
-            await schedule_delete(bot, event.chat_id, reply.id)
-            
-        except FloodWaitError as e:
-            await send_and_track(
-                bot, event,
-                f"⚠️ Too many attempts. Please wait {e.seconds} seconds and try again."
-            )
-            if session.client:
-                await session.client.disconnect()
-            del login_sessions[user_id]
-            
-        except Exception as e:
-            logger.error(f"Phone error: {e}")
-            await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /start to try again.")
-            if session.client:
-                await session.client.disconnect()
-            del login_sessions[user_id]
+                
+            except Exception as e:
+                logger.error(f"Phone error: {e}")
+                await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /start to try again.")
+                if session.client:
+                    await session.client.disconnect()
+                del login_sessions[user_id]
     
     async def handle_code(bot, event, session, code):
         """Handle verification code input."""
