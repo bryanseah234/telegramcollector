@@ -210,7 +210,7 @@ class MainWorker:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     SELECT chat_id FROM scan_checkpoints 
-                    WHERE account_id = %s AND is_complete = FALSE
+                    WHERE account_id = %s AND scan_mode = 'backfill'
                 """, (account_id,))
                 chats = await cur.fetchall()
         
