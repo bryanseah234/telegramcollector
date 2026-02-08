@@ -77,13 +77,13 @@ class MediaUploader:
         """
         # Check for duplicate
         if await self._is_duplicate(source_message_id, source_chat_id):
-            logger.debug(f"Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id}")
+            logger.info(f"⏭️ Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id}")
             return 0
         
         # Get topic info
         topic_info = await self.topic_manager.get_topic_info(db_topic_id)
         if not topic_info:
-            logger.error(f"Topic {db_topic_id} not found")
+            logger.error(f"❌ Topic {db_topic_id} not found in DB - cannot upload media!")
             return 0
         
         telegram_topic_id = topic_info['telegram_topic_id']

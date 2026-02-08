@@ -483,16 +483,22 @@ class ProcessingQueue:
         
         # Step 4: Upload media to all matched topics
         if matched_topics and self.media_uploader:
+            logger.info(f"📤 Uploading to {len(matched_topics)} topic(s) for msg {task.message_id}")
             task.content.seek(0)
             
             for topic_id in matched_topics:
-                await self.media_uploader.upload_to_topic(
+                result = await self.media_uploader.upload_to_topic(
                     db_topic_id=topic_id,
                     media_buffer=task.content,
                     source_message_id=task.message_id,
-                    source_chat_id=task.chat_id
+                    source_chat_id=task.chat_id,
+                    media_type=task.media_type
                 )
+                if result == 0:
+                    logger.warning(f"⚠️ Upload to topic {topic_id} returned 0 (failed or duplicate)")
                 task.content.seek(0)  # Reset for next upload
+        elif not matched_topics:
+            logger.debug(f"No faces matched for {task.media_type} msg {task.message_id}")
         
         # Step 5: Mark file as processed for deduplication
         if task.file_unique_id:
