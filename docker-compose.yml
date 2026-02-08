@@ -124,6 +124,7 @@ services:
       - DB_NAME=${DB_NAME:-face_archiver}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - HUB_GROUP_ID=${HUB_GROUP_ID}  # Required for config validation (healthcheck)
     volumes:
       - ./sessions:/app/sessions
     deploy:
@@ -154,6 +155,9 @@ services:
       - DB_NAME=${DB_NAME:-face_archiver}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - TG_API_ID=${TG_API_ID}        # Required for config validation (healthcheck)
+      - TG_API_HASH=${TG_API_HASH}    # Required for config validation (healthcheck)
+      - BOT_TOKEN=${BOT_TOKEN}        # Required for config validation (healthcheck)
       - HUB_GROUP_ID=${HUB_GROUP_ID}
       - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.55}
       - USE_GPU=${USE_GPU:-false}
