@@ -28,9 +28,14 @@ class TelegramClientManager:
         self._health_task = None
         self._is_healthy = False
         
-        # Ensure session directory exists
+        # Ensure session directory exists (use absolute path to match login_bot if possible, but relative works if CWD is /app)
+        # Note: login_bot now uses /app/sessions. worker.py also runs in /app.
+        # But let's log to be sure.
         os.makedirs('sessions', exist_ok=True)
         session_path = os.path.join('sessions', session_name)
+        
+        # Debug path
+        logger.debug(f"Initializing client with session path: {os.path.abspath(session_path)}")
         
         self.client = TelegramClient(session_path, self.api_id, self.api_hash)
     

