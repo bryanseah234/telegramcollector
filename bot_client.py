@@ -61,6 +61,8 @@ class BotClientManager:
         if not API_ID or not API_HASH:
             raise ValueError("TG_API_ID and TG_API_HASH environment variables are required")
         
+        from telethon.errors import FloodWaitError
+        
         # Create bot client
         self._client = TelegramClient('bot_publisher', API_ID, API_HASH)
         
@@ -68,6 +70,16 @@ class BotClientManager:
             await self._client.start(bot_token=BOT_TOKEN)
             me = await self._client.get_me()
             logger.info(f"Bot client connected: @{me.username}")
+            self._initialized = True
+            
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            logger.warning(f"⏳ Bot hit rate limit. Waiting {wait_time}s ({wait_time//60}min) before retry...")
+            await asyncio.sleep(wait_time)
+            # Retry after waiting
+            await self._client.start(bot_token=BOT_TOKEN)
+            me = await self._client.get_me()
+            logger.info(f"Bot client connected after FloodWait: @{me.username}")
             self._initialized = True
             
         except Exception as e:
