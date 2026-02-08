@@ -103,6 +103,9 @@ HUB_GROUP_ID=-1001234567890
 
 # Set a secure password
 DB_PASSWORD=MySecurePassword123!
+
+# Optional: Custom Container Names
+# COMPOSE_PROJECT_NAME=my_custom_name
 ```
 
 ---

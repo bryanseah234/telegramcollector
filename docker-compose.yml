@@ -5,7 +5,7 @@ services:
   # PostgreSQL database with pgvector
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: face_archiver_db
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_db
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${DB_NAME:-face_archiver}
@@ -37,7 +37,7 @@ services:
   # Redis for task queue and caching
   redis:
     image: redis:alpine
-    container_name: face_archiver_redis
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_redis
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -66,7 +66,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: face_archiver_app
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_app
     restart: unless-stopped
     depends_on:
       postgres:
@@ -109,7 +109,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: face_archiver_login_bot
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_login_bot
     restart: unless-stopped
     depends_on:
       postgres:
@@ -142,7 +142,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: face_archiver_dashboard
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_dashboard
     restart: unless-stopped
     depends_on:
       postgres:
@@ -174,7 +174,7 @@ services:
   # Update checker (monitors GitHub for changes)
   update_checker:
     image: alpine:latest
-    container_name: face_archiver_updater
+    container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_updater
     restart: unless-stopped
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-}
@@ -198,8 +198,8 @@ services:
 
 volumes:
   postgres_data:
-    name: face_archiver_postgres
+    name: ${COMPOSE_PROJECT_NAME:-face_archiver}_postgres
   update_signal:
-    name: face_archiver_signals
+    name: ${COMPOSE_PROJECT_NAME:-face_archiver}_signals
   redis_data:
-    name: face_archiver_redis_data
+    name: ${COMPOSE_PROJECT_NAME:-face_archiver}_redis_data
