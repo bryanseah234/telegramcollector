@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_accounts_status ON telegram_accounts(status);
-CREATE INDEX idx_accounts_last_active ON telegram_accounts(last_active DESC);
+CREATE INDEX IF NOT EXISTS idx_accounts_status ON telegram_accounts(status);
+CREATE INDEX IF NOT EXISTS idx_accounts_last_active ON telegram_accounts(last_active DESC);
 
 -- ============================================
 -- Table: telegram_topics
@@ -37,9 +37,9 @@ CREATE TABLE IF NOT EXISTS telegram_topics (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_topics_label ON telegram_topics(label);
-CREATE INDEX idx_topics_updated_at ON telegram_topics(updated_at DESC);
-CREATE INDEX idx_topics_face_count ON telegram_topics(face_count DESC);
+CREATE INDEX IF NOT EXISTS idx_topics_label ON telegram_topics(label);
+CREATE INDEX IF NOT EXISTS idx_topics_updated_at ON telegram_topics(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topics_face_count ON telegram_topics(face_count DESC);
 
 -- ============================================
 -- Table: face_embeddings
@@ -57,16 +57,16 @@ CREATE TABLE IF NOT EXISTS face_embeddings (
     detection_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_embeddings_topic ON face_embeddings(topic_id);
-CREATE INDEX idx_embeddings_source ON face_embeddings(source_chat_id, source_message_id);
-CREATE INDEX idx_embeddings_quality ON face_embeddings(quality_score DESC);
-CREATE INDEX idx_embeddings_timestamp ON face_embeddings(detection_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_embeddings_topic ON face_embeddings(topic_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_source ON face_embeddings(source_chat_id, source_message_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_quality ON face_embeddings(quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_embeddings_timestamp ON face_embeddings(detection_timestamp DESC);
 
 -- Create vector similarity search index
 -- This index dramatically speeds up nearest neighbor queries
 -- The lists parameter controls index granularity
 -- 1000 lists works well for databases with up to several million vectors
-CREATE INDEX idx_embeddings_vector ON face_embeddings 
+CREATE INDEX IF NOT EXISTS idx_embeddings_vector ON face_embeddings 
 USING ivfflat (embedding vector_cosine_ops) 
 WITH (lists = 1000);
 
@@ -88,10 +88,10 @@ CREATE TABLE IF NOT EXISTS scan_checkpoints (
     UNIQUE(account_id, chat_id)
 );
 
-CREATE INDEX idx_checkpoints_account ON scan_checkpoints(account_id);
-CREATE INDEX idx_checkpoints_mode ON scan_checkpoints(scan_mode);
-CREATE INDEX idx_checkpoints_last_updated ON scan_checkpoints(last_updated DESC);
-CREATE INDEX idx_checkpoints_chat_type ON scan_checkpoints(chat_type);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_account ON scan_checkpoints(account_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_mode ON scan_checkpoints(scan_mode);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_last_updated ON scan_checkpoints(last_updated DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_chat_type ON scan_checkpoints(chat_type);
 
 -- ============================================
 -- Table: uploaded_media
@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS uploaded_media (
     UNIQUE(source_chat_id, source_message_id)  -- Prevent duplicate uploads
 );
 
-CREATE INDEX idx_uploaded_source ON uploaded_media(source_chat_id, source_message_id);
-CREATE INDEX idx_uploaded_topic ON uploaded_media(topic_id);
+CREATE INDEX IF NOT EXISTS idx_uploaded_source ON uploaded_media(source_chat_id, source_message_id);
+CREATE INDEX IF NOT EXISTS idx_uploaded_topic ON uploaded_media(topic_id);
 
 -- ============================================
 -- Table: processed_media
@@ -127,8 +127,8 @@ CREATE TABLE IF NOT EXISTS processed_media (
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_processed_media_file ON processed_media(file_unique_id);
-CREATE INDEX idx_processed_media_time ON processed_media(processed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_processed_media_file ON processed_media(file_unique_id);
+CREATE INDEX IF NOT EXISTS idx_processed_media_time ON processed_media(processed_at DESC);
 
 
 -- ============================================
@@ -143,8 +143,8 @@ CREATE TABLE IF NOT EXISTS processing_errors (
     error_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_errors_timestamp ON processing_errors(error_timestamp DESC);
-CREATE INDEX idx_errors_type ON processing_errors(error_type);
+CREATE INDEX IF NOT EXISTS idx_errors_timestamp ON processing_errors(error_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_errors_type ON processing_errors(error_type);
 
 -- ============================================
 -- Table: processed_users
@@ -159,8 +159,8 @@ CREATE TABLE IF NOT EXISTS processed_users (
     quality_score REAL DEFAULT 0.0
 );
 
-CREATE INDEX idx_processed_users_photo ON processed_users(photo_id);
-CREATE INDEX idx_processed_users_topic ON processed_users(topic_id);
+CREATE INDEX IF NOT EXISTS idx_processed_users_photo ON processed_users(photo_id);
+CREATE INDEX IF NOT EXISTS idx_processed_users_topic ON processed_users(topic_id);
 
 -- ============================================
 -- Table: health_checks
@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS health_checks (
     response_time_ms INTEGER DEFAULT 0
 );
 
-CREATE INDEX idx_health_checks_time ON health_checks(check_time DESC);
+CREATE INDEX IF NOT EXISTS idx_health_checks_time ON health_checks(check_time DESC);
 
 
 -- ============================================
