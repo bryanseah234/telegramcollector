@@ -76,13 +76,18 @@ class MainWorker:
         # Phase 3: Processing Queue
         from processing_queue import ProcessingQueue
         num_workers = settings.NUM_WORKERS
+        high_watermark = settings.QUEUE_MAX_SIZE
+        low_watermark = max(1, int(high_watermark * 0.2)) # 20% of max
+        
         self.processing_queue = ProcessingQueue(
             face_processor=self.face_processor,
             video_extractor=self.video_extractor,
             identity_matcher=self.identity_matcher,
             media_uploader=self.media_uploader,
             topic_manager=self.topic_manager,
-            num_workers=num_workers
+            num_workers=num_workers,
+            high_watermark=high_watermark,
+            low_watermark=low_watermark
         )
         await self.processing_queue.start()
         logger.info(f"✓ Processing queue started with {num_workers} workers")
@@ -191,7 +196,7 @@ class MainWorker:
         are automatically registered without needing the Login Bot.
         """
         from telethon import TelegramClient
-        from telethon.errors import SessionPasswordNeededError
+        from telethon.errors import SessionPasswordNeededError, FloodWaitError
         from database import get_db_connection
         
         sessions_dir = settings.SESSIONS_DIR
@@ -267,6 +272,10 @@ class MainWorker:
                 
             except SessionPasswordNeededError:
                 logger.warning(f"⚠️ Session {session_name} requires 2FA password - use Login Bot")
+            except FloodWaitError as e:
+                logger.warning(f"⏳ FloodWait validating {session_name}. Waiting {e.seconds}s...")
+                await asyncio.sleep(e.seconds)
+                # Re-try this session on next startup
             except Exception as e:
                 logger.error(f"❌ Failed to validate session {session_name}: {e}")
     

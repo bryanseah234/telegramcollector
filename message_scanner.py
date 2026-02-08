@@ -124,6 +124,12 @@ class MessageScanner:
                 # Yield to event loop periodically
                 if processed_count % 10 == 0:
                     await asyncio.sleep(0)
+                
+                # CHECK BACKPRESSURE
+                # If queue is full (CRITICAL), pause scanning to prevent Redis overload
+                while self.processing_queue.should_pause():
+                    logger.warning(f"Combined Queue limit reached. Pausing scan for chat {chat_id} (backpressure)...")
+                    await asyncio.sleep(5)  # Wait 5s before checking again
             
             # Final checkpoint update
             await self._mark_chat_complete(account_id, chat_id, processed_count)

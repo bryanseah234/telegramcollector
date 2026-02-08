@@ -95,72 +95,92 @@ class TopicManager:
         import uuid
         temp_label = f"Person_{uuid.uuid4().hex[:8]}"
         
-        try:
-            # Get the hub group entity
-            hub = await client.get_input_entity(self.hub_group_id)
-            
-            # Create the forum topic with temporary name
-            result = await client(CreateForumTopicRequest(
-                channel=hub,
-                title=temp_label,
-                icon_color=icon_color,
-                random_id=random.randint(1, 2**31 - 1)
-            ))
-            
-            # Extract topic ID from result
-            telegram_topic_id = None
-            if hasattr(result, 'updates'):
-                for update in result.updates:
-                    if hasattr(update, 'id'):
-                        telegram_topic_id = update.id
-                        break
-            
-            if not telegram_topic_id:
-                # Fallback: get from the message
-                if hasattr(result, 'updates'):
-                    for update in result.updates:
-                        if hasattr(update, 'message') and hasattr(update.message, 'reply_to'):
-                            if hasattr(update.message.reply_to, 'reply_to_top_id'):
-                                telegram_topic_id = update.message.reply_to.reply_to_top_id
-                                break
-            
-            if not telegram_topic_id:
-                raise RuntimeError("Could not extract topic ID from CreateForumTopicRequest result")
-            
-            # Save to database FIRST to get unique auto-increment ID
-            db_id = await self._save_topic_to_db(telegram_topic_id, temp_label)
-            
-            # Now rename topic to use the guaranteed unique DB ID
-            final_label = label if label else f"Person {db_id}"
-            
-            if final_label != temp_label:
-                # Rename in Telegram
-                await client(EditForumTopicRequest(
+        from telethon.errors import FloodWaitError
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # Get the hub group entity
+                hub = await client.get_input_entity(self.hub_group_id)
+                
+                # Create the forum topic with temporary name
+                result = await client(CreateForumTopicRequest(
                     channel=hub,
-                    topic_id=telegram_topic_id,
-                    title=final_label
+                    title=temp_label,
+                    icon_color=icon_color,
+                    random_id=random.randint(1, 2**31 - 1)
                 ))
                 
-                # Update label in database
-                async with get_db_connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("""
-                            UPDATE telegram_topics 
-                            SET label = %s
-                            WHERE id = %s
-                        """, (final_label, db_id))
-            
-            logger.info(f"Created topic '{final_label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
-            
-            return {
-                'db_id': db_id,
-                'telegram_topic_id': telegram_topic_id,
-                'label': final_label
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to create topic: {e}")
-            raise
+                # Extract topic ID from result
+                telegram_topic_id = None
+                if hasattr(result, 'updates'):
+                    for update in result.updates:
+                        if hasattr(update, 'id'):
+                            telegram_topic_id = update.id
+                            break
+                
+                if not telegram_topic_id:
+                    # Fallback: get from the message
+                    if hasattr(result, 'updates'):
+                        for update in result.updates:
+                            if hasattr(update, 'message') and hasattr(update.message, 'reply_to'):
+                                if hasattr(update.message.reply_to, 'reply_to_top_id'):
+                                    telegram_topic_id = update.message.reply_to.reply_to_top_id
+                                    break
+                
+                if not telegram_topic_id:
+                    raise RuntimeError("Could not extract topic ID from CreateForumTopicRequest result")
+                
+                # Save to database FIRST to get unique auto-increment ID
+                db_id = await self._save_topic_to_db(telegram_topic_id, temp_label)
+                
+                # Now rename topic to use the guaranteed unique DB ID
+                final_label = label if label else f"Person {db_id}"
+                
+                if final_label != temp_label:
+                    # Rename in Telegram (with FloodWait handling)
+                    try:
+                        await client(EditForumTopicRequest(
+                            channel=hub,
+                            topic_id=telegram_topic_id,
+                            title=final_label
+                        ))
+                    except FloodWaitError as e:
+                        logger.warning(f"⏳ FloodWait on rename. Waiting {e.seconds}s...")
+                        await asyncio.sleep(e.seconds)
+                        await client(EditForumTopicRequest(
+                            channel=hub,
+                            topic_id=telegram_topic_id,
+                            title=final_label
+                        ))
+                    
+                    # Update label in database
+                    async with get_db_connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute("""
+                                UPDATE telegram_topics 
+                                SET label = %s
+                                WHERE id = %s
+                            """, (final_label, db_id))
+                
+                logger.info(f"Created topic '{final_label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
+                
+                return {
+                    'db_id': db_id,
+                    'telegram_topic_id': telegram_topic_id,
+                    'label': final_label
+                }
+                
+            except FloodWaitError as e:
+                logger.warning(f"⏳ FloodWait creating topic. Waiting {e.seconds}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(e.seconds)
+                # Continue to next attempt
+                
+            except Exception as e:
+                logger.error(f"Failed to create topic: {e}")
+                raise
+        
+        raise RuntimeError(f"Failed to create topic after {max_retries} FloodWait retries")
     
     async def rename_topic(self, db_topic_id: int, new_label: str) -> bool:
         """
@@ -174,6 +194,7 @@ class TopicManager:
             True if successful
         """
         client = await self._get_client()
+        from telethon.errors import FloodWaitError
         
         try:
             # Get the Telegram topic ID from database
@@ -187,12 +208,21 @@ class TopicManager:
             # Get hub entity
             hub = await client.get_input_entity(self.hub_group_id)
             
-            # Rename in Telegram
-            await client(EditForumTopicRequest(
-                channel=hub,
-                topic_id=telegram_topic_id,
-                title=new_label
-            ))
+            # Rename in Telegram (with FloodWait handling)
+            try:
+                await client(EditForumTopicRequest(
+                    channel=hub,
+                    topic_id=telegram_topic_id,
+                    title=new_label
+                ))
+            except FloodWaitError as e:
+                logger.warning(f"⏳ FloodWait on rename. Waiting {e.seconds}s...")
+                await asyncio.sleep(e.seconds)
+                await client(EditForumTopicRequest(
+                    channel=hub,
+                    topic_id=telegram_topic_id,
+                    title=new_label
+                ))
             
             # Update database
             async with get_db_connection() as conn:

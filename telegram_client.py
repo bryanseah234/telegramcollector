@@ -89,6 +89,12 @@ class TelegramClientManager:
             logger.error(f"Session is invalid/revoked: {e}")
             await self._handle_invalid_session()
             raise  # Re-raise so the caller (worker.py) knows to skip this account
+        
+        except FloodWaitError as e:
+            logger.warning(f"⏳ FloodWait starting client. Waiting {e.seconds}s...")
+            await asyncio.sleep(e.seconds)
+            # Retry connection after wait
+            return await self.start(phone)
             
         except Exception as e:
             logger.error(f"Failed to start telegram client: {e}")
