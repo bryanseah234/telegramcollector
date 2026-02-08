@@ -239,9 +239,10 @@ async def main():
             # Send instruction (no tracking needed for this follow-up)
             reply = await event.respond(
                 "✅ **Code sent!**\n\n"
-                "You should receive a code from Telegram.\n"
-                "**Send me the code** (you can type it or forward the message).\n\n"
-                "Example: `12345`"
+                "Telegram might block the sign-in if you forward or copy-paste the code directly.\n\n"
+                "**Please type the code manually with spaces:**\n"
+                "Example: `1 2 3 4 5`\n\n"
+                "(I will automatically remove the spaces)"
             )
             await schedule_delete(bot, event.chat_id, reply.id)
             
