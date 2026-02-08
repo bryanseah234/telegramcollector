@@ -35,8 +35,8 @@ class DatabaseManager:
             
             self.pool = AsyncConnectionPool(
                 conninfo=conn_str,
-                min_size=5,
-                max_size=20,
+                min_size=1,  # Reduced from 5 to prevent connection exhaustion
+                max_size=10, # Reduced from 20
                 open=False, # Don't open immediately, open in context or below
                 kwargs={
                     'autocommit': True
