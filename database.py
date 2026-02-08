@@ -98,3 +98,28 @@ async def check_db_health():
         return True
     except Exception:
         return False
+
+async def log_processing_error(error_type: str, error_message: str, error_context: dict = None):
+    """
+    Logs a processing error to the database for dashboard display.
+    
+    Args:
+        error_type: Category of error (e.g., 'FaceDetection', 'MediaDownload')
+        error_message: Detailed error description
+        error_context: Optional dictionary with extra context (chat_id, message_id, etc.)
+    """
+    try:
+        import json
+        context_json = json.dumps(error_context) if error_context else None
+        
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO processing_errors 
+                        (error_type, error_message, error_context)
+                    VALUES (%s, %s, %s)
+                """, (error_type, str(error_message), context_json))
+    except Exception as e:
+        # Fallback to logger if DB logging fails
+        logger.error(f"Failed to log error to DB: {e}")
+

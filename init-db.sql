@@ -128,18 +128,6 @@ CREATE TABLE IF NOT EXISTS processed_media (
 CREATE INDEX idx_processed_media_file ON processed_media(file_unique_id);
 CREATE INDEX idx_processed_media_time ON processed_media(processed_at DESC);
 
--- ============================================
--- Table: processing_metrics
--- ============================================
--- Stores time-series metrics for dashboard display
-CREATE TABLE IF NOT EXISTS processing_metrics (
-    id SERIAL PRIMARY KEY,
-    metric_name VARCHAR(100) NOT NULL,
-    metric_value BIGINT NOT NULL,
-    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_metrics_name_time ON processing_metrics(metric_name, recorded_at DESC);
 
 -- ============================================
 -- Table: processing_errors
@@ -191,34 +179,11 @@ CREATE TABLE IF NOT EXISTS health_checks (
 
 CREATE INDEX idx_health_checks_time ON health_checks(check_time DESC);
 
--- ============================================
--- Table: excluded_chats
--- ============================================
--- Tracks chats that should NOT be scanned (user opt-out)
-CREATE TABLE IF NOT EXISTS excluded_chats (
-    id SERIAL PRIMARY KEY,
-    account_id INTEGER REFERENCES telegram_accounts(id) ON DELETE CASCADE,
-    chat_id BIGINT NOT NULL,
-    chat_title VARCHAR(255),
-    excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    reason VARCHAR(255),
-    UNIQUE(account_id, chat_id)
-);
-
-CREATE INDEX idx_excluded_account ON excluded_chats(account_id);
 
 -- ============================================
 -- Maintenance Functions
 -- ============================================
 
--- Function to clean up old metrics (keep last 30 days)
-CREATE OR REPLACE FUNCTION cleanup_old_metrics()
-RETURNS void AS $$
-BEGIN
-    DELETE FROM processing_metrics 
-    WHERE recorded_at < NOW() - INTERVAL '30 days';
-END;
-$$ LANGUAGE plpgsql;
 
 -- Function to update topic statistics
 CREATE OR REPLACE FUNCTION update_topic_stats(p_topic_id INTEGER)
