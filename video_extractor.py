@@ -37,7 +37,7 @@ class VideoFrameExtractor:
         # Adding simple fallback for now or we can add to Settings class if critical
         self.default_fps = 1.0 
         self.round_video_fps = 2.0  # Higher sampling for round videos
-        self.max_frames = 100  # Cap to prevent memory issues
+        self.max_frames = 30  # Cap to prevent memory issues (30 frames * 1080p is ~180MB)
         
         logger.info(f"VideoFrameExtractor initialized. Default FPS: {self.default_fps}")
     

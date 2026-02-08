@@ -31,6 +31,10 @@ class MediaDownloadManager:
         max_size = max_size_mb or int(os.getenv('MAX_MEDIA_SIZE_MB', 200))
         self.max_size_bytes = max_size * 1024 * 1024
         
+        # Limit concurrent downloads to prevent memory spikes
+        # 3 concurrent 5MB photos is fine, but 3 concurrent 50MB videos is heavy.
+        self._download_semaphore = asyncio.Semaphore(5)
+        
         logger.info(f"MediaDownloadManager initialized. Max size: {max_size}MB")
     
     async def download_media(self, message) -> Optional[io.BytesIO]:
@@ -48,14 +52,17 @@ class MediaDownloadManager:
             if not self._check_size(message):
                 return None
             
-            # Create buffer for download
-            buffer = io.BytesIO()
+            async with self._download_semaphore:
+                # Create buffer for download
+                buffer = io.BytesIO()
+                
+                # Download directly to buffer
+                await message.download_media(file=buffer)
+                
+                # Reset buffer position for reading
+                buffer.seek(0)
             
-            # Download directly to buffer
-            await message.download_media(file=buffer)
-            
-            # Reset buffer position for reading
-            buffer.seek(0)
+            # Verify we got content
             
             # Verify we got content
             if buffer.getbuffer().nbytes == 0:
