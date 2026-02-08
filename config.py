@@ -31,7 +31,6 @@ class Settings(BaseSettings):
     USE_GPU: bool = False
     
     # Operational
-    ACCOUNT_ID: int = 1
     RUN_MODE: str = "both"  # backfill, realtime, both
     HEALTH_CHECK_INTERVAL: int = 1800
     LOGIN_BOT_ID: Optional[str] = None

@@ -10,6 +10,7 @@ import logging
 import asyncio
 import os
 import signal
+from typing import Dict, List
 from config import settings
 
 # Configure logging
@@ -23,10 +24,11 @@ logger = logging.getLogger(__name__)
 class MainWorker:
     """
     Main application worker that coordinates all components.
+    Supports multiple Telegram accounts running in parallel.
     """
     
     def __init__(self):
-        self.client = None
+        self.clients: Dict[int, 'TelegramClientManager'] = {}  # account_id -> client_manager
         self.processing_queue = None
         self._shutdown_event = asyncio.Event()
     
@@ -35,17 +37,10 @@ class MainWorker:
         logger.info("Initializing application components...")
         
         # Phase 1: Database
-        from database import init_db, db_manager
+        from database import init_db, db_manager, get_db_connection
         await db_manager.initialize()
         await init_db()
         logger.info("✓ Database initialized (Phase 1)")
-        
-        # Phase 2: Telegram User Client (for scanning)
-        from telegram_client import TelegramClientManager
-        self.client_manager = TelegramClientManager()
-        await self.client_manager.start()
-        self.client = self.client_manager.client
-        logger.info("✓ Telegram user client connected (Phase 2)")
         
         # Phase 2: Bot Client (for topics and publishing)
         from bot_client import bot_client_manager
@@ -62,11 +57,6 @@ class MainWorker:
         self.media_uploader = MediaUploader(topic_manager=self.topic_manager)  # Uses bot_client singleton
         logger.info("✓ Media uploader ready (using bot)")
 
-        
-        # Phase 2: Media Downloader
-        from media_downloader import MediaDownloadManager
-        self.media_downloader = MediaDownloadManager(self.client)
-        logger.info("✓ Media downloader ready")
         
         # Phase 3: Face Processor
         from face_processor import FaceProcessor
@@ -96,31 +86,81 @@ class MainWorker:
         )
         await self.processing_queue.start()
         logger.info(f"✓ Processing queue started with {num_workers} workers")
-        
-        # Phase 2: Message Scanner (needs processing queue)
+
+        # Phase 2: Load User Accounts (Multiple)
+        from telegram_client import TelegramClientManager
+        from media_downloader import MediaDownloadManager
         from message_scanner import MessageScanner, RealtimeScanner
-        self.message_scanner = MessageScanner(
-            client=self.client,
-            media_manager=self.media_downloader,
-            processing_queue=self.processing_queue
-        )
-        self.realtime_scanner = RealtimeScanner(
-            client=self.client,
-            media_manager=self.media_downloader,
-            processing_queue=self.processing_queue
-        )
-        logger.info("✓ Message scanners ready")
+
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT id, phone_number, session_file_path FROM telegram_accounts WHERE status = 'active'")
+                rows = await cur.fetchall()
+
+        if not rows:
+            logger.warning("⚠️  No active Telegram accounts found in database! Please register with the Login Bot.")
         
-        logger.info("All components initialized successfully!")
+        self.scanners = {} # account_id -> (MessageScanner, RealtimeScanner)
+
+        for account_id, phone, session_path in rows:
+            try:
+                # Extract session name from path (e.g., "sessions/account_123.session" -> "account_123")
+                session_name = os.path.splitext(os.path.basename(session_path))[0]
+                
+                logger.info(f"Connecting account {account_id} ({phone})...")
+                manager = TelegramClientManager(session_name=session_name)
+                await manager.start()
+                
+                self.clients[account_id] = manager
+                
+                # Create Scanners for this account
+                # Note: MediaDownloadManager needs a client. We create one per account.
+                media_downloader = MediaDownloadManager(manager.client)
+                
+                scanner = MessageScanner(
+                    client=manager.client,
+                    media_manager=media_downloader,
+                    processing_queue=self.processing_queue
+                )
+                
+                rt_scanner = RealtimeScanner(
+                    client=manager.client,
+                    media_manager=media_downloader,
+                    processing_queue=self.processing_queue
+                )
+                
+                self.scanners[account_id] = (scanner, rt_scanner)
+                logger.info(f"✓ Account {account_id} connected and scanners ready")
+                
+            except Exception as e:
+                logger.error(f"Failed to connect account {account_id} ({phone}): {e}")
+
+        logger.info(f"✓ All {len(self.clients)} accounts initialized successfully!")
     
-    async def run_backfill(self, account_id: int = 1):
-        """Runs backfill scanning of all chats."""
-        logger.info("Starting backfill scan...")
+    async def run_backfill(self):
+        """Runs backfill scanning for ALL connected accounts."""
+        if not self.clients:
+            logger.warning("No accounts connected. Skipping backfill.")
+            return
+
+        logger.info("Starting backfill scan for all accounts...")
+        
+        tasks = []
+        for account_id in self.clients:
+            tasks.append(self._run_single_backfill(account_id))
+        
+        await asyncio.gather(*tasks)
+        logger.info("Backfill scan complete for all accounts!")
+
+    async def _run_single_backfill(self, account_id: int):
+        """Runs backfill for a single account."""
+        scanner, _ = self.scanners[account_id]
+        logger.info(f"Running backfill for Account {account_id}...")
         
         # Discover all chats
-        await self.message_scanner.discover_and_scan_all_chats(account_id)
+        await scanner.discover_and_scan_all_chats(account_id)
         
-        # Get incomplete chats and process them
+        # Resume incomplete chats
         from database import get_db_connection
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
@@ -132,18 +172,34 @@ class MainWorker:
         
         for (chat_id,) in chats:
             try:
-                await self.message_scanner.scan_chat_backfill(account_id, chat_id)
+                await scanner.scan_chat_backfill(account_id, chat_id)
             except Exception as e:
-                logger.error(f"Error scanning chat {chat_id}: {e}")
-        
-        logger.info("Backfill scan complete!")
+                logger.error(f"Error scanning chat {chat_id} (Account {account_id}): {e}")
     
-    async def run_realtime(self, account_id: int = 1):
-        """Runs real-time message monitoring."""
-        logger.info("Starting real-time monitoring...")
+    async def run_realtime(self):
+        """Runs real-time monitoring for ALL connected accounts."""
+        if not self.clients:
+            logger.warning("No accounts connected. Waiting for shutdown...")
+            await self._shutdown_event.wait()
+            return
+
+        logger.info("Starting real-time monitoring for all accounts...")
         
-        # Get all chats from DB to monitor (or just monitor all dialogs)
-        # For now, let's monitor all chats we know about
+        tasks = []
+        for account_id in self.clients:
+            tasks.append(self._run_single_realtime(account_id))
+        
+        # Also wait for shutdown event
+        tasks.append(self._shutdown_event.wait())
+        
+        # Run until shutdown
+        await asyncio.gather(*tasks)
+
+    async def _run_single_realtime(self, account_id: int):
+        """Runs realtime monitor for a single account."""
+        _, rt_scanner = self.scanners[account_id]
+        
+        # Get chats to monitor
         from database import get_db_connection
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
@@ -152,30 +208,26 @@ class MainWorker:
                 chat_ids = [row[0] for row in rows]
         
         if chat_ids:
-            await self.realtime_scanner.start_monitoring(chat_ids, account_id)
+            logger.info(f"Account {account_id}: Monitoring {len(chat_ids)} chats")
+            # start_monitoring is usually non-blocking (sets up event handlers), 
+            # but if it blocks, this approach is fine as we use gather.
+            # However, looking at previous implementation, it sets up handlers.
+            # We just need to ensure we don't block here if start_monitoring blocks.
+            # Assuming start_monitoring just adds event handlers.
+            await rt_scanner.start_monitoring(chat_ids, account_id)
         else:
-            logger.warning("No chats found to monitor for realtime.")
-            
-        # Keep running until shutdown
-        await self._shutdown_event.wait()
+            logger.warning(f"Account {account_id}: No chats found to monitor.")
     
     async def run(self, mode: str = 'both'):
-        """
-        Main run method.
-        
-        Args:
-            mode: 'backfill', 'realtime', or 'both'
-        """
+        """Main run method."""
         try:
             await self.initialize()
             
-            account_id = settings.ACCOUNT_ID
-            
             if mode in ('backfill', 'both'):
-                await self.run_backfill(account_id)
+                await self.run_backfill()
             
             if mode in ('realtime', 'both'):
-                await self.run_realtime(account_id)
+                await self.run_realtime()
                 
         except Exception as e:
             logger.error(f"Fatal error: {e}")
@@ -198,9 +250,10 @@ class MainWorker:
             # await self.processing_queue.stop()
             pass
         
-        # Disconnect Telegram
-        if hasattr(self, 'client_manager'):
-            await self.client_manager.stop()
+        # Disconnect all Telegram clients
+        for account_id, manager in self.clients.items():
+            await manager.stop()
+            logger.info(f"Disconnected account {account_id}")
         
         from database import db_manager
         await db_manager.close()
@@ -232,7 +285,6 @@ def main():
         loop.run_until_complete(worker.run(mode))
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-        # Ensure shutdown is called
         loop.run_until_complete(worker.shutdown())
     except Exception as e:
         logger.error(f"Worker crashed: {e}")

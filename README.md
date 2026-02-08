@@ -36,7 +36,7 @@ Before starting, you need:
 ### Step 1: Download the Project
 
 ```bash
-git clone https://github.com/yourusername/telegramcollector.git
+git clone https://github.com/bryanseah234/telegramcollector.git
 cd telegramcollector
 ```
 

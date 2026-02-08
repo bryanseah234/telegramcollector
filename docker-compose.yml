@@ -86,7 +86,6 @@ services:
       - NUM_WORKERS=${NUM_WORKERS:-3}
       - USE_GPU=${USE_GPU:-false}
       - RUN_MODE=${RUN_MODE:-both}
-      - ACCOUNT_ID=${ACCOUNT_ID:-1}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
