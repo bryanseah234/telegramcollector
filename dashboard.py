@@ -8,7 +8,27 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import os
-from database import get_db_connection
+import psycopg
+from config import settings
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_connection():
+    """
+    Synchronous database connection for Streamlit.
+    """
+    conn_str = (
+        f"host={settings.DB_HOST} "
+        f"port={settings.DB_PORT} "
+        f"dbname={settings.DB_NAME} "
+        f"user={settings.DB_USER} "
+        f"password={settings.DB_PASSWORD}"
+    )
+    conn = psycopg.connect(conn_str, autocommit=True)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 # Page configuration
 st.set_page_config(

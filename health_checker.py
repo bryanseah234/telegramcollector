@@ -128,7 +128,7 @@ class HealthChecker:
         response_time_ms = int((time.time() - start_time) * 1000)
         
         # Store results
-        self._store_results(results, response_time_ms)
+        await self._store_results(results, response_time_ms)
         
         # Log summary
         status = "✓" if all([
@@ -142,10 +142,14 @@ class HealthChecker:
     
     async def _check_database(self) -> bool:
         """Tests database connectivity."""
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            return cursor.fetchone() is not None
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SELECT 1")
+                    result = await cursor.fetchone()
+                    return result is not None
+        except Exception:
+            return False
     
     async def _check_telegram(self) -> bool:
         """Tests Telegram connection and authorization."""
@@ -179,57 +183,60 @@ class HealthChecker:
         except Exception:
             return False
     
-    def _store_results(self, results: Dict[str, Any], response_time_ms: int):
+    async def _store_results(self, results: Dict[str, Any], response_time_ms: int):
         """Stores health check results in database."""
         try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO health_checks 
-                        (database_ok, telegram_ok, face_model_ok, hub_access_ok,
-                         queue_size, workers_active, error_message, response_time_ms)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    results['database_ok'],
-                    results['telegram_ok'],
-                    results['face_model_ok'],
-                    results['hub_access_ok'],
-                    results['queue_size'],
-                    results['workers_active'],
-                    results['error_message'],
-                    response_time_ms
-                ))
-                conn.commit()
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("""
+                        INSERT INTO health_checks 
+                            (database_ok, telegram_ok, face_model_ok, hub_access_ok,
+                             queue_size, workers_active, error_message, response_time_ms)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        results['database_ok'],
+                        results['telegram_ok'],
+                        results['face_model_ok'],
+                        results['hub_access_ok'],
+                        results['queue_size'],
+                        results['workers_active'],
+                        results['error_message'],
+                        response_time_ms
+                    ))
+                    # autocommit should be on, but if not:
+                    # await conn.commit() 
+        except Exception as e:
+            logger.error(f"Failed to store health check: {e}")
         except Exception as e:
             logger.error(f"Failed to store health check: {e}")
     
-    def get_latest_status(self) -> Dict[str, Any]:
+    async def get_latest_status(self) -> Dict[str, Any]:
         """Retrieves the most recent health check from database."""
         try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT check_time, database_ok, telegram_ok, face_model_ok, 
-                           hub_access_ok, queue_size, workers_active, error_message
-                    FROM health_checks
-                    ORDER BY check_time DESC
-                    LIMIT 1
-                """)
-                row = cursor.fetchone()
-                
-                if row:
-                    return {
-                        'check_time': row[0],
-                        'database_ok': row[1],
-                        'telegram_ok': row[2],
-                        'face_model_ok': row[3],
-                        'hub_access_ok': row[4],
-                        'queue_size': row[5],
-                        'workers_active': row[6],
-                        'error_message': row[7],
-                        'all_ok': all([row[1], row[2], row[3], row[4]])
-                    }
-                return None
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("""
+                        SELECT check_time, database_ok, telegram_ok, face_model_ok, 
+                               hub_access_ok, queue_size, workers_active, error_message
+                        FROM health_checks
+                        ORDER BY check_time DESC
+                        LIMIT 1
+                    """)
+                    row = await cursor.fetchone()
+                    
+                    if row:
+                        return {
+                            'check_time': row[0],
+                            'database_ok': row[1],
+                            'telegram_ok': row[2],
+                            'face_model_ok': row[3],
+                            'hub_access_ok': row[4],
+                            'queue_size': row[5],
+                            'workers_active': row[6],
+                            'error_message': row[7],
+                            'all_ok': all([row[1], row[2], row[3], row[4]])
+                        }
+                    return None
         except Exception as e:
             logger.error(f"Failed to get health status: {e}")
             return None

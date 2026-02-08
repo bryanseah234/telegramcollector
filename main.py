@@ -86,17 +86,18 @@ async def _register_account(user):
     """
     Registers the current Telegram account in the database.
     """
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO telegram_accounts (phone_number, session_file_path, status)
-            VALUES (%s, %s, 'active')
-            ON CONFLICT (phone_number) DO UPDATE SET last_active = NOW()
-            RETURNING id
-        """, (user.phone or 'unknown', 'session'))
-        row = cursor.fetchone()
-        conn.commit()
-        return row[0]
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("""
+                INSERT INTO telegram_accounts (phone_number, session_file_path, status)
+                VALUES (%s, %s, 'active')
+                ON CONFLICT (phone_number) DO UPDATE SET last_active = NOW()
+                RETURNING id
+            """, (user.phone or 'unknown', 'session'))
+            row = await cursor.fetchone()
+            # conn.commit() # Not needed if autocommit=True, catch likely true in pool
+            # But let's check validation - database.py has autocommit=True.
+            return row[0]
 
 if __name__ == '__main__':
     try:

@@ -423,22 +423,32 @@ async def main():
                 f"account_{session.phone.replace('+', '')}.session"
             )
             
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO telegram_accounts 
-                        (phone_number, session_file_path, status)
-                    VALUES (%s, %s, 'active')
-                    ON CONFLICT (phone_number) DO UPDATE SET
-                        session_file_path = EXCLUDED.session_file_path,
-                        status = 'active',
-                        last_error = NULL,
-                        last_active = NOW()
-                    RETURNING id
-                """, (session.phone, session_path))
-                
-                account_id = cursor.fetchone()[0]
-                conn.commit()
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("""
+                        INSERT INTO telegram_accounts 
+                            (phone_number, session_file_path, status)
+                        VALUES (%s, %s, 'active')
+                        ON CONFLICT (phone_number) DO UPDATE SET
+                            session_file_path = EXCLUDED.session_file_path,
+                            status = 'active',
+                            last_error = NULL,
+                            last_active = NOW()
+                        RETURNING id
+                    """, (session.phone, session_path))
+                    
+                    row = await cursor.fetchone()
+                    if row:
+                        account_id = row[0]
+                    else:
+                        raise ValueError("Failed to retrieve account ID")
+                    # commit not needed if autocommit=True, but safer to check if pool config allows.
+                    # With autocommit=True in pool, explicit commit is usually redundant but okay.
+                    # However, if using transaction block (async with conn.transaction()), it's better.
+                    # Given prior code used explicit commit, I'll remove it if confirmed autocommit=True,
+                    # or await it.
+                    # Let's check pool config in database.py again. Autocommit=True.
+                    # So no manual commit needed.
                 
             logger.info(f"Saved account {session.phone} (ID: {account_id})")
             
