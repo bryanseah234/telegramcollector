@@ -461,9 +461,14 @@ class ProcessingQueue:
         
         # Step 2 & 3: Detect faces and match identities
         matched_topics = set()
+        total_faces_detected = 0
         
         for frame_idx, frame in enumerate(frames):
             faces = await self.face_processor.process_image(frame)
+            total_faces_detected += len(faces)
+            
+            if faces:
+                logger.info(f"🔍 Frame {frame_idx}: detected {len(faces)} face(s)")
             
             for face in faces:
                 self.stats['faces_found'] += 1
@@ -477,9 +482,14 @@ class ProcessingQueue:
                 )
                 
                 if topic_id:
+                    logger.debug(f"  → Face matched to topic {topic_id} (new={is_new}, quality={face['quality']:.2f})")
                     matched_topics.add(topic_id)
                     if is_new:
                         self.stats['new_identities'] += 1
+                else:
+                    logger.debug(f"  → Face skipped (quality={face['quality']:.2f}, below threshold?)")
+        
+        logger.info(f"👥 Total: {total_faces_detected} faces detected → {len(matched_topics)} unique topic(s)")
         
         # Step 4: Upload media to all matched topics
         if matched_topics and self.media_uploader:

@@ -66,7 +66,8 @@ class TopicManager:
         return await get_bot_client()
     
     async def _get_next_label_number(self) -> int:
-        """Gets the next sequential label number for new identities."""
+        """DEPRECATED: Use DB auto-increment instead."""
+        # This method is kept for backwards compatibility but should not be used
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM telegram_topics")
@@ -77,6 +78,8 @@ class TopicManager:
         """
         Creates a new forum topic in the hub group.
         
+        Uses atomic DB insert to get unique ID, avoiding race conditions.
+        
         Args:
             label: Optional label for the topic. If None, uses "Person N" format.
             
@@ -85,22 +88,21 @@ class TopicManager:
         """
         client = await self._get_client()
         
-        # Generate label if not provided
-        if not label:
-            num = await self._get_next_label_number()
-            label = f"Person {num}"
-        
         # Select random icon color
         icon_color = random.choice(TOPIC_ICON_COLORS)
+        
+        # Generate a temporary unique label to avoid Telegram duplicate title issues
+        import uuid
+        temp_label = f"Person_{uuid.uuid4().hex[:8]}"
         
         try:
             # Get the hub group entity
             hub = await client.get_input_entity(self.hub_group_id)
             
-            # Create the forum topic
+            # Create the forum topic with temporary name
             result = await client(CreateForumTopicRequest(
                 channel=hub,
-                title=label,
+                title=temp_label,
                 icon_color=icon_color,
                 random_id=random.randint(1, 2**31 - 1)
             ))
@@ -125,19 +127,39 @@ class TopicManager:
             if not telegram_topic_id:
                 raise RuntimeError("Could not extract topic ID from CreateForumTopicRequest result")
             
-            # Save to database
-            db_id = await self._save_topic_to_db(telegram_topic_id, label)
+            # Save to database FIRST to get unique auto-increment ID
+            db_id = await self._save_topic_to_db(telegram_topic_id, temp_label)
             
-            logger.info(f"Created topic '{label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
+            # Now rename topic to use the guaranteed unique DB ID
+            final_label = label if label else f"Person {db_id}"
+            
+            if final_label != temp_label:
+                # Rename in Telegram
+                await client(EditForumTopicRequest(
+                    channel=hub,
+                    topic_id=telegram_topic_id,
+                    title=final_label
+                ))
+                
+                # Update label in database
+                async with get_db_connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("""
+                            UPDATE telegram_topics 
+                            SET label = %s
+                            WHERE id = %s
+                        """, (final_label, db_id))
+            
+            logger.info(f"Created topic '{final_label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
             
             return {
                 'db_id': db_id,
                 'telegram_topic_id': telegram_topic_id,
-                'label': label
+                'label': final_label
             }
             
         except Exception as e:
-            logger.error(f"Failed to create topic '{label}': {e}")
+            logger.error(f"Failed to create topic: {e}")
             raise
     
     async def rename_topic(self, db_topic_id: int, new_label: str) -> bool:
