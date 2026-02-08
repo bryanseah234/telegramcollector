@@ -46,7 +46,14 @@ class Settings(BaseSettings):
 try:
     settings = Settings()
 except Exception as e:
-    print(f"CRITICAL: Failed to load configuration: {e}")
-    # We don't exit here to allow import in some contexts, 
-    # but application will likely fail if settings are invalid.
-    settings = None
+    import sys
+    print("\n" + "="*60)
+    print("CRITICAL CONFIGURATION ERROR")
+    print("="*60)
+    print(f"Error details: {e}")
+    print("\nThis usually means a required environment variable is missing.")
+    print("Please check your .env file against .env.template.")
+    print("Common missing variables: TG_API_ID, TG_API_HASH, BOT_TOKEN")
+    print("="*60 + "\n")
+    # Choosing to exit here is safer than running with broken config
+    sys.exit(1)
