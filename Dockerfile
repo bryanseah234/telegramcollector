@@ -71,4 +71,4 @@ CMD ["python", "worker.py"]
 # Health check
 # ============================================
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "from database import get_db_connection; c = get_db_connection(); c.close()" || exit 1
+    CMD python -c "import asyncio, sys; from database import check_db_health; sys.exit(0 if asyncio.run(check_db_health()) else 1)"
