@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     RUN_MODE: str = "both"  # backfill, realtime, both
     HEALTH_CHECK_INTERVAL: int = 1800
     LOGIN_BOT_ID: Optional[str] = None
+    SESSIONS_DIR: str = "sessions"  # Directory for session files
+    
+    # Compatibility aliases
+    @property
+    def TELEGRAM_API_ID(self) -> int:
+        return self.TG_API_ID
+    
+    @property
+    def TELEGRAM_API_HASH(self) -> str:
+        return self.TG_API_HASH
     
     model_config = SettingsConfigDict(
         env_file=".env",
