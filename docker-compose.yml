@@ -74,6 +74,7 @@ services:
     environment:
       - TG_API_ID=${TG_API_ID}
       - TG_API_HASH=${TG_API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
       - HUB_GROUP_ID=${HUB_GROUP_ID}
       - DB_HOST=postgres
       - DB_PORT=5432
