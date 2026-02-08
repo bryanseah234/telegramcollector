@@ -1,7 +1,13 @@
 import logging
 import asyncio
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import (
+    FloodWaitError, 
+    SessionPasswordNeededError, 
+    SessionRevokedError, 
+    AuthKeyError, 
+    UserDeactivatedError
+)
 import os
 from database import get_db_connection
 
@@ -35,32 +41,85 @@ class TelegramClientManager:
         Args:
             phone: Phone number for first-time authorization (optional if session exists)
         """
-        await self.client.connect()
-        
-        # Check authorization status
-        if not await self.client.is_user_authorized():
-            if phone:
-                logger.info(f"Authorizing with phone: {phone}")
-                await self.client.start(phone=phone)
+        try:
+            await self.client.connect()
+            
+            # Check authorization status
+            if not await self.client.is_user_authorized():
+                if phone:
+                    logger.info(f"Authorizing with phone: {phone}")
+                    await self.client.start(phone=phone)
+                else:
+                    # Prompt for phone in interactive mode
+                    await self.client.start()
+            
+            # Verify we're logged in
+            me = await self.client.get_me()
+            if me:
+                logger.info(f"Telegram client started. Logged in as: {me.first_name} (@{me.username or 'N/A'})")
+                self._is_healthy = True
             else:
-                # Prompt for phone in interactive mode
-                await self.client.start()
-        
-        # Verify we're logged in
-        me = await self.client.get_me()
-        if me:
-            logger.info(f"Telegram client started. Logged in as: {me.first_name} (@{me.username or 'N/A'})")
-            self._is_healthy = True
-        else:
-            raise RuntimeError("Failed to get user info after authorization")
-        
-        # Start health monitoring
-        self._health_task = asyncio.create_task(self._health_monitor())
-        
-        # Schedule auto-cleanup of login messages
-        asyncio.create_task(self._cleanup_login_messages())
-        
-        return me
+                raise RuntimeError("Failed to get user info after authorization")
+            
+            # Start health monitoring
+            self._health_task = asyncio.create_task(self._health_monitor())
+            
+            # Schedule auto-cleanup of login messages
+            asyncio.create_task(self._cleanup_login_messages())
+            
+            return me
+
+        except (SessionRevokedError, AuthKeyError, UserDeactivatedError) as e:
+            logger.error(f"Session is invalid/revoked: {e}")
+            await self._handle_invalid_session()
+            raise  # Re-raise so the caller (worker.py) knows to skip this account
+            
+        except Exception as e:
+            logger.error(f"Failed to start telegram client: {e}")
+            raise
+
+    async def _handle_invalid_session(self):
+        """
+        Handles cleanup for invalid sessions:
+        1. Updates DB status to 'invalid'
+        2. Deletes the local .session file
+        """
+        try:
+            # 1. Update Database
+            # We need to construct the likely path stored in DB to match it.
+            # self.session_name is just the name (e.g., 'account_123')
+            # The DB stores 'sessions/account_123.session' usually.
+            
+            # Construct standard path
+            session_file_path = os.path.join('sessions', f"{self.session_name}.session")
+            
+            # Also try without extension just in case
+            
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        UPDATE telegram_accounts 
+                        SET status = 'invalid', last_error = 'Session revoked/invalid'
+                        WHERE session_file_path = %s 
+                           OR session_file_path = %s
+                    """, (session_file_path, os.path.join('sessions', self.session_name)))
+                    await conn.commit()
+            
+            logger.info("Marked account as invalid in database.")
+
+            # 2. Delete Local File
+            full_path = f"{session_file_path}"
+            if os.path.exists(full_path):
+                os.remove(full_path)
+                logger.info(f"Deleted invalid session file: {full_path}")
+            else:
+                # Telethon might append .session automatically if we passed a path without it
+                # check if self.client.session.filename is available? 
+                # For now, just try deleting with .session extension
+                pass
+
+        except Exception as e:
+            logger.error(f"Error during invalid session cleanup: {e}")
     
     async def _health_monitor(self):
         """

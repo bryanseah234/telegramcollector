@@ -288,6 +288,12 @@ async def main():
             me = await session.client.get_me()
             await save_account(session, me)
             
+            # --- PERSISTENCE CLEANUP: Remove traces of Login Bot ---
+            # Get bot username to target self
+            me_bot = await bot.get_me()
+            asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
+            # -----------------------------------------------------
+
             reply = await event.respond(
                 f"🎉 **Login Successful!**\n\n"
                 f"👤 Name: {me.first_name} {me.last_name or ''}\n"
@@ -341,6 +347,12 @@ async def main():
             me = await session.client.get_me()
             await save_account(session, me)
             
+            # --- PERSISTENCE CLEANUP: Remove traces of Login Bot ---
+            # Get bot username to target self
+            me_bot = await bot.get_me()
+            asyncio.create_task(cleanup_login_bot_interaction(session.client, me_bot.username))
+            # -----------------------------------------------------
+
             reply = await event.respond(
                 f"🎉 **Login Successful!**\n\n"
                 f"👤 Name: {me.first_name} {me.last_name or ''}\n"
@@ -380,6 +392,7 @@ async def main():
                     ON CONFLICT (phone_number) DO UPDATE SET
                         session_file_path = EXCLUDED.session_file_path,
                         status = 'active',
+                        last_error = NULL,
                         last_active = NOW()
                     RETURNING id
                 """, (session.phone, session_path))
@@ -391,7 +404,27 @@ async def main():
             
         except Exception as e:
             logger.error(f"Failed to save account: {e}")
-    
+
+    async def cleanup_login_bot_interaction(client, bot_username):
+        """
+        Cleans up interactions with THIS Login Bot to remove footprints.
+        1. Finds chat with this bot.
+        2. Deletes all messages.
+        3. Deletes/Leaves the chat.
+        """
+        try:
+            logger.info(f"Cleaning up interaction with bot @{bot_username}...")
+            bot_entity = await client.get_input_entity(bot_username)
+            
+            if bot_entity:
+                # Delete dialog history (messages + chat)
+                # revoke=True handles both sides if possible, mainly for bot interactions
+                await client.delete_dialog(bot_entity, revoke=True)
+                logger.info(f"Deleted dialog and history with @{bot_username}.")
+        except Exception as e:
+            # It's okay if this fails (e.g., chat not found), just log it
+            logger.warning(f"Failed to cleanup login bot interaction: {e}")
+
     # Keep bot running
     logger.info("Bot is running. Press Ctrl+C to stop.")
     await bot.run_until_disconnected()
