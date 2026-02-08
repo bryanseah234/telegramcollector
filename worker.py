@@ -96,6 +96,14 @@ class MainWorker:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id, phone_number, session_file_path FROM telegram_accounts WHERE status = 'active'")
                 rows = await cur.fetchall()
+                
+                # Debug: check total accounts
+                await cur.execute("SELECT COUNT(*), status FROM telegram_accounts GROUP BY status")
+                stats = await cur.fetchall()
+                if stats:
+                    logger.info(f"Account stats in DB: {stats}")
+                else:
+                    logger.info("Account stats in DB: No accounts found.")
 
         if not rows:
             logger.warning("⚠️  No active Telegram accounts found in database! Please register with the Login Bot.")

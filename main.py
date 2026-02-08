@@ -89,9 +89,11 @@ async def _register_account(user):
     async with get_db_connection() as conn:
         async with conn.cursor() as cursor:
             await cursor.execute("""
-                INSERT INTO telegram_accounts (phone_number, session_file_path, status)
-                VALUES (%s, %s, 'active')
-                ON CONFLICT (phone_number) DO UPDATE SET last_active = NOW()
+                INSERT INTO telegram_accounts (phone_number, session_file_path, status, last_error)
+                VALUES (%s, %s, 'active', NULL)
+                ON CONFLICT (phone_number) DO UPDATE SET 
+                    last_active = NOW(),
+                    last_error = NULL
                 RETURNING id
             """, (user.phone or 'unknown', 'session'))
             row = await cursor.fetchone()

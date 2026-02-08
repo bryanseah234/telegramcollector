@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('TG_API_ID', 0))
 API_HASH = os.getenv('TG_API_HASH')
-SESSIONS_DIR = '/app/sessions'
+SESSIONS_DIR = 'sessions'
 AUTO_DELETE_SECONDS = 120  # 2 minutes
 
 # Debug: Log current directory and sessions path

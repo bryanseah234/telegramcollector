@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     id SERIAL PRIMARY KEY,
     phone_number VARCHAR(20) UNIQUE NOT NULL,
     session_file_path VARCHAR(255) NOT NULL,
-    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'paused', 'error')),
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'paused', 'error', 'invalid')),
+    last_error TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
