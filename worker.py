@@ -92,6 +92,9 @@ class MainWorker:
         from media_downloader import MediaDownloadManager
         from message_scanner import MessageScanner, RealtimeScanner
 
+        # AUTO-DISCOVERY: Scan sessions directory and register any existing sessions
+        await self._auto_discover_sessions()
+
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id, phone_number, session_file_path FROM telegram_accounts WHERE status = 'active'")
@@ -180,6 +183,91 @@ class MainWorker:
             
         except Exception as e:
             logger.warning(f"Failed to send startup status: {e}")
+    
+    async def _auto_discover_sessions(self):
+        """
+        Auto-discovers and registers existing session files.
+        This enables self-healing after database wipes - existing sessions
+        are automatically registered without needing the Login Bot.
+        """
+        from telethon import TelegramClient
+        from telethon.errors import SessionPasswordNeededError
+        
+        sessions_dir = settings.SESSIONS_DIR
+        if not os.path.exists(sessions_dir):
+            logger.info(f"Sessions directory does not exist: {sessions_dir}")
+            return
+        
+        # Find all .session files
+        session_files = [f for f in os.listdir(sessions_dir) if f.endswith('.session')]
+        
+        if not session_files:
+            logger.info("No session files found for auto-discovery.")
+            return
+        
+        logger.info(f"🔍 Auto-discovery: Found {len(session_files)} session file(s)")
+        
+        for session_file in session_files:
+            session_name = session_file.replace('.session', '')
+            session_path = os.path.join(sessions_dir, session_file)
+            
+            try:
+                # Check if already registered in database
+                async with get_db_connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT id FROM telegram_accounts WHERE session_file_path = %s",
+                            (session_path,)
+                        )
+                        existing = await cur.fetchone()
+                        
+                        if existing:
+                            logger.debug(f"Session {session_name} already registered (ID: {existing[0]})")
+                            continue
+                
+                # Try to connect and validate the session
+                logger.info(f"🔄 Validating session: {session_name}")
+                
+                client = TelegramClient(
+                    os.path.join(sessions_dir, session_name),
+                    settings.TELEGRAM_API_ID,
+                    settings.TELEGRAM_API_HASH
+                )
+                
+                await client.connect()
+                
+                if not await client.is_user_authorized():
+                    logger.warning(f"⚠️ Session {session_name} is not authorized (needs re-login)")
+                    await client.disconnect()
+                    continue
+                
+                # Get user info for the phone number
+                me = await client.get_me()
+                phone = me.phone or f"unknown_{session_name}"
+                
+                await client.disconnect()
+                
+                # Register in database
+                async with get_db_connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("""
+                            INSERT INTO telegram_accounts (phone_number, session_file_path, status)
+                            VALUES (%s, %s, 'active')
+                            ON CONFLICT (phone_number) DO UPDATE SET 
+                                session_file_path = EXCLUDED.session_file_path,
+                                status = 'active',
+                                last_active = NOW()
+                            RETURNING id
+                        """, (phone, session_path))
+                        result = await cur.fetchone()
+                        account_id = result[0] if result else None
+                
+                logger.info(f"✅ Auto-registered session: {phone} (ID: {account_id})")
+                
+            except SessionPasswordNeededError:
+                logger.warning(f"⚠️ Session {session_name} requires 2FA password - use Login Bot")
+            except Exception as e:
+                logger.error(f"❌ Failed to validate session {session_name}: {e}")
     
     async def run_backfill(self):
         """Runs backfill scanning for ALL connected accounts."""
