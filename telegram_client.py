@@ -37,7 +37,18 @@ class TelegramClientManager:
         # Debug path
         logger.debug(f"Initializing client with session path: {os.path.abspath(session_path)}")
         
-        self.client = TelegramClient(session_path, self.api_id, self.api_hash)
+        # Use SQLiteSession with increased timeout to prevent "database is locked" errors
+        # when multiple clients access session files concurrently
+        from telethon.sessions import SQLiteSession
+        session = SQLiteSession(session_path)
+        
+        # Set SQLite timeout to 30 seconds (default is 5)
+        # This allows concurrent operations to wait instead of failing immediately
+        import sqlite3
+        if hasattr(session, '_conn') and session._conn:
+            session._conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds
+        
+        self.client = TelegramClient(session, self.api_id, self.api_hash)
     
     async def start(self, phone: str = None):
         """
@@ -129,7 +140,12 @@ class TelegramClientManager:
     async def _health_monitor(self):
         """
         Periodically checks connection health and reconnects if needed.
+        Uses exponential backoff for reconnection attempts.
         """
+        MAX_RECONNECT_ATTEMPTS = 5
+        BASE_RECONNECT_DELAY = 5  # seconds
+        reconnect_attempts = 0
+        
         while True:
             try:
                 await asyncio.sleep(60)  # Check every minute
@@ -137,15 +153,43 @@ class TelegramClientManager:
                 if not self.client.is_connected():
                     logger.warning("Connection lost. Attempting to reconnect...")
                     self._is_healthy = False
-                    await self.client.connect()
                     
-                    if await self.client.is_user_authorized():
-                        self._is_healthy = True
-                        logger.info("Reconnected successfully.")
-                    else:
-                        logger.error("Reconnected but not authorized. Session may have expired.")
+                    # Exponential backoff for reconnection
+                    delay = BASE_RECONNECT_DELAY * (2 ** reconnect_attempts)
+                    if reconnect_attempts > 0:
+                        logger.info(f"Reconnect attempt {reconnect_attempts + 1}/{MAX_RECONNECT_ATTEMPTS} after {delay}s...")
+                        await asyncio.sleep(delay)
+                    
+                    try:
+                        await self.client.connect()
+                        
+                        if await self.client.is_user_authorized():
+                            self._is_healthy = True
+                            reconnect_attempts = 0  # Reset on success
+                            logger.info("Reconnected successfully.")
+                        else:
+                            logger.error("Reconnected but not authorized. Session may have expired.")
+                            reconnect_attempts += 1
+                    except Exception as conn_err:
+                        reconnect_attempts += 1
+                        logger.warning(f"Reconnect failed: {conn_err}")
+                        
+                        if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                            logger.error(f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) reached. Giving up.")
+                            # Log to database
+                            try:
+                                from database import log_processing_error
+                                await log_processing_error(
+                                    error_type='ClientDisconnected',
+                                    error_message=f"Max reconnect attempts reached: {conn_err}",
+                                    error_context={'session': self.session_name}
+                                )
+                            except Exception:
+                                pass
+                            break
                 else:
                     self._is_healthy = True
+                    reconnect_attempts = 0  # Reset when healthy
                     
             except asyncio.CancelledError:
                 break

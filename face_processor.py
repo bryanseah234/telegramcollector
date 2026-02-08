@@ -25,39 +25,68 @@ class FaceProcessor:
     
     _instance = None
     _executor = ThreadPoolExecutor(max_workers=2)
+    _initialized = False
     
     def __init__(self, providers: list = None):
         """
-        Initialize InsightFace model.
+        Initialize InsightFace model with retry logic.
         
         Args:
             providers: ONNX Runtime providers. Defaults to CPU, set to 
                       ['CUDAExecutionProvider'] for GPU acceleration.
         """
-        from insightface.app import FaceAnalysis
-        from config import settings
+        self.providers = providers
+        self.app = None
+        self.min_quality = 0.3  # Default, will be overwritten
         
-        # Use environment variable or default to CPU
-        if providers is None:
-            gpu_enabled = settings.USE_GPU
-            if gpu_enabled:
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            else:
-                providers = ['CPUExecutionProvider']
+    def _lazy_init(self):
+        """Lazy initialization of InsightFace model with retry logic."""
+        if self._initialized:
+            return True
+            
+        MAX_RETRIES = 3
         
-        self.app = FaceAnalysis(name='buffalo_l', providers=providers)
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
+        for attempt in range(MAX_RETRIES):
+            try:
+                from insightface.app import FaceAnalysis
+                from config import settings
+                
+                # Use environment variable or default to CPU
+                if self.providers is None:
+                    gpu_enabled = settings.USE_GPU
+                    if gpu_enabled:
+                        self.providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    else:
+                        self.providers = ['CPUExecutionProvider']
+                
+                self.app = FaceAnalysis(name='buffalo_l', providers=self.providers)
+                self.app.prepare(ctx_id=0, det_size=(640, 640))
+                
+                # Quality threshold from environment
+                self.min_quality = settings.MIN_QUALITY_THRESHOLD
+                
+                self._initialized = True
+                logger.info(f"InsightFace initialized. Providers: {self.providers}, Min quality: {self.min_quality}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"FaceProcessor init failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.error("FaceProcessor initialization failed after max retries")
+                    return False
         
-        # Quality threshold from environment
-        self.min_quality = settings.MIN_QUALITY_THRESHOLD
-        
-        logger.info(f"InsightFace initialized. Providers: {providers}, Min quality: {self.min_quality}")
+        return False
     
     @classmethod
     def get_instance(cls) -> 'FaceProcessor':
         """Gets or creates singleton instance."""
         if cls._instance is None:
             cls._instance = FaceProcessor()
+        # Ensure lazy init is done
+        cls._instance._lazy_init()
         return cls._instance
     
     async def process_image(self, image_input) -> List[Dict]:

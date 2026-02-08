@@ -123,6 +123,13 @@ class ProcessingQueue:
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
             raise
+        
+        # Dead letter queue for failed tasks
+        self.dead_letter_key = "processing_queue:dead_letter"
+        self.max_task_retries = 3
+        
+        # Task execution timeout (prevent stuck workers)
+        self.task_timeout_seconds = 300  # 5 minutes max per task
 
     async def start(self):
         """Starts the worker pool."""
@@ -307,12 +314,20 @@ class ProcessingQueue:
                 )
                 
                 try:
-                    await self._process_task(task, worker_id)
+                    # Add timeout protection to prevent stuck workers
+                    await asyncio.wait_for(
+                        self._process_task(task, worker_id),
+                        timeout=self.task_timeout_seconds
+                    )
                     self.stats['processed'] += 1
+                except asyncio.TimeoutError:
+                    logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s")
+                    self.stats['errors'] += 1
+                    await self._move_to_dead_letter(task_data, "timeout")
                 except Exception as e:
                     logger.error(f"Worker {worker_id} error processing task: {e}")
                     self.stats['errors'] += 1
-                    # Optional: Re-queue failed task or move to dead-letter queue
+                    await self._move_to_dead_letter(task_data, str(e))
                     
             except asyncio.CancelledError:
                 break
@@ -321,6 +336,51 @@ class ProcessingQueue:
                 await asyncio.sleep(1)
         
         logger.info(f"Worker {worker_id} stopped")
+
+    async def _move_to_dead_letter(self, task_data: dict, error_reason: str):
+        """
+        Moves a failed task to the dead letter queue for later analysis.
+        
+        Args:
+            task_data: Original task data dict
+            error_reason: Description of why the task failed
+        """
+        import json
+        
+        try:
+            # Add failure metadata
+            task_data['_failure_reason'] = error_reason
+            task_data['_failed_at'] = datetime.now(timezone.utc).isoformat()
+            task_data['_retry_count'] = task_data.get('_retry_count', 0) + 1
+            
+            # Remove large content to save space (just keep ID/metadata)
+            if 'content_b64' in task_data:
+                task_data['_had_content'] = True
+                del task_data['content_b64']
+            
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                self.redis_client.rpush,
+                self.dead_letter_key,
+                json.dumps(task_data)
+            )
+            
+            # Also log to database for dashboard visibility
+            from database import log_processing_error
+            await log_processing_error(
+                error_type='TaskFailed',
+                error_message=error_reason,
+                error_context={
+                    'chat_id': task_data.get('chat_id'),
+                    'message_id': task_data.get('message_id'),
+                    'task_type': task_data.get('task_type')
+                }
+            )
+            
+            logger.warning(f"Task moved to dead letter queue: {error_reason}")
+        except Exception as e:
+            logger.error(f"Failed to move task to dead letter queue: {e}")
 
     async def _update_heartbeat(self, worker_id: int):
         """Updates the heartbeat timestamp for a worker in Redis."""

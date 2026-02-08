@@ -306,35 +306,81 @@ class MainWorker:
 
 
 def main():
-    """Entry point."""
-    worker = MainWorker()
+    """Entry point with crash recovery and auto-restart."""
+    MAX_RESTART_ATTEMPTS = 5
+    BASE_RESTART_DELAY = 10  # seconds
+    restart_count = 0
     
-    # Handle signals for graceful shutdown
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    while restart_count < MAX_RESTART_ATTEMPTS:
+        worker = MainWorker()
+        
+        # Handle signals for graceful shutdown
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            worker._shutdown_event.set()
+            asyncio.create_task(worker.shutdown())
+        
+        # Register signal handlers where supported
+        if os.name != 'nt':  # Not Windows
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, signal_handler)
+        
+        try:
+            mode = settings.RUN_MODE  # 'backfill', 'realtime', or 'both'
+            logger.info(f"Starting worker (attempt {restart_count + 1}/{MAX_RESTART_ATTEMPTS})")
+            loop.run_until_complete(worker.run(mode))
+            
+            # If we get here normally (not exception), don't restart
+            logger.info("Worker completed normally")
+            break
+            
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+            loop.run_until_complete(worker.shutdown())
+            break  # Don't restart on user interrupt
+            
+        except Exception as e:
+            restart_count += 1
+            delay = BASE_RESTART_DELAY * (2 ** (restart_count - 1))  # Exponential backoff
+            
+            logger.error(f"Worker crashed (attempt {restart_count}/{MAX_RESTART_ATTEMPTS}): {e}")
+            
+            # Log error to database (async in sync context)
+            try:
+                from database import log_processing_error
+                loop.run_until_complete(log_processing_error(
+                    error_type='WorkerCrash',
+                    error_message=str(e),
+                    error_context={'restart_count': restart_count, 'mode': settings.RUN_MODE}
+                ))
+            except Exception as log_err:
+                logger.warning(f"Failed to log crash to DB: {log_err}")
+            
+            # Cleanup
+            try:
+                loop.run_until_complete(worker.shutdown())
+            except Exception:
+                pass
+            
+            if restart_count < MAX_RESTART_ATTEMPTS:
+                logger.info(f"Restarting in {delay} seconds...")
+                import time
+                time.sleep(delay)
+            else:
+                logger.error("Max restart attempts reached. Exiting.")
+                
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
     
-    def signal_handler():
-        logger.info("Received shutdown signal")
-        worker._shutdown_event.set()
-        # Create a task to shutdown properly if waiting on event
-        asyncio.create_task(worker.shutdown())
-    
-    # Register signal handlers where supported
-    if os.name != 'nt':  # Not Windows
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
-    
-    try:
-        mode = settings.RUN_MODE  # 'backfill', 'realtime', or 'both'
-        loop.run_until_complete(worker.run(mode))
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        loop.run_until_complete(worker.shutdown())
-    except Exception as e:
-        logger.error(f"Worker crashed: {e}")
-    finally:
-        loop.close()
+    logger.info("Worker process exiting")
 
 
 if __name__ == '__main__':
     main()
+

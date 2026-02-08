@@ -253,7 +253,15 @@ async def main():
         # Use lock to prevent concurrent SQLite access (Docker volumes can be slow)
         lock = get_session_lock(phone)
         async with lock:
-            session.client = TelegramClient(session_file, API_ID, API_HASH)
+            # Use SQLiteSession with increased timeout to prevent "database is locked" errors
+            from telethon.sessions import SQLiteSession
+            sqlite_session = SQLiteSession(session_file)
+            
+            # Set SQLite timeout to 30 seconds (default is 5)
+            if hasattr(sqlite_session, '_conn') and sqlite_session._conn:
+                sqlite_session._conn.execute("PRAGMA busy_timeout = 30000")
+            
+            session.client = TelegramClient(sqlite_session, API_ID, API_HASH)
             
             try:
                 await session.client.connect()

@@ -58,24 +58,47 @@ class DatabaseManager:
 db_manager = DatabaseManager()
 
 @contextlib.asynccontextmanager
-async def get_db_connection():
+async def get_db_connection(max_retries: int = 3, retry_delay: float = 1.0):
     """
-    Async context manager for getting a database connection.
+    Async context manager for getting a database connection with retry logic.
+    
+    Args:
+        max_retries: Maximum number of connection attempts
+        retry_delay: Base delay between retries (exponential backoff applied)
+    
     Usage:
         async with get_db_connection() as conn:
-            await conn.execute(...)
-            
-    Note: In psycopg 3, usage is slightly different:
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(...)
-            result = await cur.fetchone()
+            async with conn.cursor() as cur:
+                await cur.execute(...)
+                result = await cur.fetchone()
     """
     if db_manager.pool is None:
         await db_manager.initialize()
-        
-    async with db_manager.pool.connection() as conn:
-        yield conn
+    
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            async with db_manager.pool.connection() as conn:
+                yield conn
+                return  # Success
+        except psycopg.OperationalError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = retry_delay * (2 ** attempt)
+                logger.warning(f"DB connection failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s...")
+                import asyncio
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"DB connection failed after {max_retries} attempts: {e}")
+                raise
+        except Exception as e:
+            # For non-operational errors, don't retry
+            logger.error(f"DB error (not retrying): {e}")
+            raise
+    
+    # Should not reach here, but just in case
+    if last_error:
+        raise last_error
 
 async def init_db():
     """Initializes the database schema."""
