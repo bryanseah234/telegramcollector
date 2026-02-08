@@ -204,18 +204,28 @@ class MainWorker:
         # Discover all chats
         await scanner.discover_and_scan_all_chats(account_id)
         
-        # Resume incomplete chats
+        # Resume incomplete chats - ORDERED BY PRIORITY (personal → group → channel)
         from database import get_db_connection
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    SELECT chat_id FROM scan_checkpoints 
+                    SELECT chat_id, chat_type FROM scan_checkpoints 
                     WHERE account_id = %s AND scan_mode = 'backfill'
+                    ORDER BY 
+                        CASE chat_type 
+                            WHEN 'personal' THEN 1 
+                            WHEN 'group' THEN 2 
+                            WHEN 'channel' THEN 3 
+                            ELSE 4 
+                        END
                 """, (account_id,))
                 chats = await cur.fetchall()
         
-        for (chat_id,) in chats:
+        logger.info(f"Account {account_id}: Scanning {len(chats)} chats in priority order (personal → group → channel)")
+        
+        for chat_id, chat_type in chats:
             try:
+                logger.info(f"Scanning {chat_type} chat {chat_id}...")
                 await scanner.scan_chat_backfill(account_id, chat_id)
             except Exception as e:
                 logger.error(f"Error scanning chat {chat_id} (Account {account_id}): {e}")

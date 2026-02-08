@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS scan_checkpoints (
     account_id INTEGER REFERENCES telegram_accounts(id) ON DELETE CASCADE,
     chat_id BIGINT NOT NULL,
     chat_title VARCHAR(255),
+    chat_type VARCHAR(20) DEFAULT 'group' CHECK (chat_type IN ('personal', 'group', 'channel')),
     last_processed_message_id BIGINT,
     total_messages INTEGER DEFAULT 0,
     processed_messages INTEGER DEFAULT 0,
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS scan_checkpoints (
 CREATE INDEX idx_checkpoints_account ON scan_checkpoints(account_id);
 CREATE INDEX idx_checkpoints_mode ON scan_checkpoints(scan_mode);
 CREATE INDEX idx_checkpoints_last_updated ON scan_checkpoints(last_updated DESC);
+CREATE INDEX idx_checkpoints_chat_type ON scan_checkpoints(chat_type);
 
 -- ============================================
 -- Table: uploaded_media

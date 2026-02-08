@@ -32,23 +32,43 @@ class MessageScanner:
     async def discover_and_scan_all_chats(self, account_id: int):
         """
         Iterates through ALL dialogs (groups, channels, DMs) and adds them to the scan list.
+        Categorizes by type: 'personal', 'group', 'channel'
         Feature: "scraping of all existing groups, channels and DMs"
         """
         logger.info("Starting discovery of all dialogs...")
         count = 0
+        stats = {'personal': 0, 'group': 0, 'channel': 0}
+        
         try:
             async for dialog in self.client.iter_dialogs():
                 chat_id = dialog.id
                 chat_title = dialog.title or f"Chat_{chat_id}"
                 
-                # Add to checkpoint table if not exists
-                await self._init_checkpoint(account_id, chat_id, chat_title)
+                # Determine chat type for priority ordering
+                entity = dialog.entity
+                if isinstance(entity, User):
+                    chat_type = 'personal'
+                elif isinstance(entity, Channel):
+                    # Channels include supergroups (megagroups) and broadcast channels
+                    if entity.megagroup:
+                        chat_type = 'group'  # Supergroups are treated as groups
+                    else:
+                        chat_type = 'channel'  # Broadcast channels
+                elif isinstance(entity, Chat):
+                    chat_type = 'group'  # Basic groups
+                else:
+                    chat_type = 'group'  # Default to group
+                
+                stats[chat_type] += 1
+                
+                # Add to checkpoint table if not exists (with chat_type)
+                await self._init_checkpoint(account_id, chat_id, chat_title, chat_type)
                 count += 1
                 
                 if count % 10 == 0:
                     logger.info(f"Discovered {count} dialogs so far...")
             
-            logger.info(f"Discovery complete. Found {count} dialogs.")
+            logger.info(f"Discovery complete. Found {count} dialogs: {stats['personal']} personal, {stats['group']} groups, {stats['channel']} channels")
             return count
             
         except FloodWaitError as e:
@@ -59,16 +79,16 @@ class MessageScanner:
             logger.error(f"Error discovering dialogs: {e}")
             return count
 
-    async def _init_checkpoint(self, account_id: int, chat_id: int, title: str):
+    async def _init_checkpoint(self, account_id: int, chat_id: int, title: str, chat_type: str = 'group'):
         """Initializes a checkpoint for a chat if it doesn't exist."""
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     INSERT INTO scan_checkpoints 
-                        (account_id, chat_id, chat_title, last_processed_message_id, scan_mode)
-                    VALUES (%s, %s, %s, 0, 'backfill')
-                    ON CONFLICT (account_id, chat_id) DO NOTHING
-                """, (account_id, chat_id, title))
+                        (account_id, chat_id, chat_title, chat_type, last_processed_message_id, scan_mode)
+                    VALUES (%s, %s, %s, %s, 0, 'backfill')
+                    ON CONFLICT (account_id, chat_id) DO UPDATE SET chat_type = EXCLUDED.chat_type
+                """, (account_id, chat_id, title, chat_type))
 
     async def scan_chat_backfill(self, account_id: int, chat_id: int):
         """
