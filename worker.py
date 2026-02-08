@@ -136,6 +136,42 @@ class MainWorker:
                 logger.error(f"Failed to connect account {account_id} ({phone}): {e}")
 
         logger.info(f"✓ All {len(self.clients)} accounts initialized successfully!")
+        
+        # Log status to Hub Group
+        await self.log_startup_status()
+
+    async def log_startup_status(self):
+        """Logs system startup status to the Hub Group."""
+        try:
+            from bot_client import bot_client_manager
+            client = bot_client_manager.client
+            hub_id = settings.HUB_GROUP_ID
+            
+            if not hub_id:
+                return
+
+            active_accounts = len(self.clients)
+            mode = settings.RUN_MODE.upper()
+            workers = settings.NUM_WORKERS
+            version = "1.0.0" # Could be dynamic
+            
+            message = (
+                f"🚀 **Face Archiver System Online**\n\n"
+                f"📊 **Status Report:**\n"
+                f"• **Active Accounts:** `{active_accounts}`\n"
+                f"• **Run Mode:** `{mode}`\n"
+                f"• **Workers:** `{workers}`\n"
+                f"• **System:** `Operational`\n"
+                f"\n"
+                f"🔍 *Monitoring started for all connected accounts.*"
+            )
+            
+            # Send to Hub Group (General Topic by default if no thread_id specified)
+            await client.send_message(hub_id, message)
+            logger.info(f"Sent startup status to Hub Group {hub_id}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to send startup status: {e}")
     
     async def run_backfill(self):
         """Runs backfill scanning for ALL connected accounts."""
