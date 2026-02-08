@@ -192,6 +192,7 @@ class MainWorker:
         """
         from telethon import TelegramClient
         from telethon.errors import SessionPasswordNeededError
+        from database import get_db_connection
         
         sessions_dir = settings.SESSIONS_DIR
         if not os.path.exists(sessions_dir):
