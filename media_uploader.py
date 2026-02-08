@@ -123,8 +123,20 @@ class MediaUploader:
                 # Reset buffer position
                 media_buffer.seek(0)
                 
-                # Upload the file first
-                uploaded_file = await client.upload_file(media_buffer)
+                # Determine file extension based on media type
+                extension_map = {
+                    'photo': '.jpg',
+                    'video': '.mp4',
+                    'video_note': '.mp4',
+                }
+                ext = extension_map.get(media_type, '.bin')
+                filename = f"media_{source_chat_id}_{source_message_id}{ext}"
+                
+                # Upload the file with proper filename
+                uploaded_file = await client.upload_file(
+                    media_buffer,
+                    file_name=filename
+                )
                 
                 # Prepare send_file kwargs based on media type
                 send_kwargs = {
