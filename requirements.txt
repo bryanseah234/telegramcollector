@@ -1,0 +1,30 @@
+# Core Dependencies
+telethon==1.36.0
+psycopg[binary,pool]==3.1.18
+numpy==1.26.4
+python-dotenv==1.0.1
+redis==5.0.1
+
+# Database
+pgvector==0.2.5
+
+# Media Processing
+insightface==0.7.3
+onnxruntime==1.17.1
+opencv-python-headless==4.9.0.80
+av==11.0.0
+Pillow==10.2.0
+
+# Dashboard
+streamlit==1.32.0
+pandas==2.2.1
+altair==5.2.0
+
+# Testing
+pytest==8.0.2
+pytest-asyncio==0.23.5
+
+# Utilities
+watchdog==4.0.0
+requests==2.31.0
+aiofiles==23.2.1

@@ -1,0 +1,887 @@
+# Product Requirements Document: Telegram Face Recognition Archival System
+
+## Part 2: Core Processing Pipeline Implementation
+
+### 2.1 Processing Pipeline Architecture Overview
+
+The processing pipeline represents the central nervous system of your application. Understanding how data flows through this pipeline and how each stage transforms that data is essential for implementing a robust and maintainable system. The pipeline operates as a series of asynchronous tasks coordinated by Python's asyncio event loop, allowing multiple operations to proceed concurrently without blocking each other.
+
+The pipeline begins when the message scanner discovers media content in a Telegram chat. At this point, the media exists only as metadata in a Telegram message object. The scanner has information about the file size, type, and Telegram's internal file reference, but the actual pixels or video frames have not yet been transferred to your system. This separation between discovery and retrieval is intentional, allowing the scanner to quickly enumerate available media without consuming bandwidth or memory for content that might be filtered out.
+
+When the scanner determines that a piece of media should be processed, it passes the message object to the download manager. The download manager evaluates whether the media meets processing criteria, checking file size limits and media type compatibility. If the media passes these checks, the manager initiates a streaming download directly into memory. This is where your minimal disk usage constraint becomes operationally significant. Traditional implementations would download files to temporary storage, process them from disk, and then delete the temporary files. Your implementation bypasses this entirely by treating media as ephemeral streams that exist in RAM only for the duration of processing.
+
+Once media is buffered in memory, the processing diverges based on content type. Images proceed directly to face detection since they are already in a complete, processable format. Videos require an intermediate frame extraction step that converts the compressed video stream into individual image frames suitable for face detection. This extraction must be intelligent about which frames to process, balancing computational efficiency against detection completeness. After frame extraction, videos and images converge into the same face detection pathway.
+
+The face detection stage consumes image data and produces structured face information. For each detected face, the detector provides a bounding box indicating spatial location, facial landmarks marking key features like eyes and nose, and most critically, a numerical embedding vector that serves as that face's biometric signature. This embedding is the mathematical representation that makes similarity comparison and clustering possible.
+
+The final stage of the pipeline queries the database to determine if each detected face matches an existing identity or represents a new person. Based on similarity scores against known embeddings, the system assigns each face to a topic. The original media then uploads to the appropriate Telegram forum topics, creating a permanent, organized archive. Throughout this flow, the pipeline maintains checkpoint state so that interruptions do not result in lost progress or duplicate processing.
+
+### 2.2 Message Scanning and Discovery
+
+The message scanner operates in two distinct modes that require different implementation approaches. Understanding when and how to use each mode is critical for building a system that efficiently processes both historical data and real-time updates.
+
+**Backfill Mode for Historical Processing**
+
+Backfill mode handles the initial scan of chat history when an account is first added to the system or when scanning a newly discovered chat. This mode must efficiently iterate through potentially millions of messages while maintaining resumable progress. Telethon provides the iter_messages method specifically designed for this use case.
+
+The implementation batches messages to balance memory usage against API efficiency. Processing messages one at a time would result in excessive API calls and poor throughput. Processing all messages at once would exhaust memory for large chats. The optimal approach processes messages in batches of one hundred, which fits comfortably in memory while minimizing API round trips.
+
+```python
+import asyncio
+from telethon import TelegramClient
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MessageScanner:
+    """
+    Scans Telegram chats for media content, operating in either backfill
+    or real-time mode. Maintains checkpoint state for resumable processing.
+    """
+    
+    def __init__(self, client: TelegramClient, db_pool):
+        self.client = client
+        self.db_pool = db_pool
+        self.batch_size = 100
+    
+    async def scan_chat_backfill(self, account_id: int, chat_id: int):
+        """
+        Performs historical backfill of a chat, processing all accessible messages
+        from newest to oldest. Updates checkpoint state after each batch.
+        
+        Args:
+            account_id: Database ID of the Telegram account performing the scan
+            chat_id: Telegram chat identifier to scan
+        """
+        # Retrieve the last processed message ID from checkpoint table
+        last_processed = await self._get_checkpoint(account_id, chat_id)
+        
+        logger.info(f"Starting backfill for chat {chat_id}, resuming from message {last_processed}")
+        
+        # Calculate total message count for progress tracking
+        total_messages = await self._get_chat_message_count(chat_id)
+        processed_count = 0
+        
+        # [NEW FEATURE] Discovery of All Dialogs
+        # Automatically discover and add all dialogs to the scan list
+        await self.discover_and_scan_all_chats(account_id)
+        
+        try:
+            # Iterate backwards through history from the checkpoint
+            # offset_id tells Telethon where to start iteration
+            # If last_processed is None (new chat), this starts from the most recent message
+            async for message in self.client.iter_messages(
+                chat_id,
+                offset_id=last_processed,
+                reverse=False,  # False means newest to oldest
+                limit=None  # None means process all messages
+            ):
+                # Check if message contains media we want to process
+                if await self._should_process_message(message):
+                    # Queue message for processing
+                    await self._queue_for_processing(message, account_id, chat_id)
+                
+                processed_count += 1
+                
+                # Update checkpoint every batch to enable resumption
+                if processed_count % self.batch_size == 0:
+                    await self._update_checkpoint(account_id, chat_id, message.id)
+                    logger.info(f"Processed {processed_count}/{total_messages} messages in chat {chat_id}")
+                
+                # Yield control to event loop periodically to prevent blocking
+                if processed_count % 10 == 0:
+                    await asyncio.sleep(0)
+            
+            # Final checkpoint update after completing the chat
+            await self._update_checkpoint(account_id, chat_id, 0)
+            await self._mark_chat_complete(account_id, chat_id)
+            logger.info(f"Completed backfill for chat {chat_id}, processed {processed_count} messages")
+            
+        except Exception as e:
+            logger.error(f"Error during backfill of chat {chat_id}: {e}")
+            # Checkpoint was updated during processing, so we can safely resume later
+            raise
+    
+    async def _should_process_message(self, message) -> bool:
+        """
+        Determines whether a message contains media that should be processed.
+        
+        Filters for photos and videos while excluding other media types like
+        audio files, documents without visual content, or stickers.
+        """
+        if not message.media:
+            return False
+        
+        # Process photos directly
+        if isinstance(message.media, MessageMediaPhoto):
+            return True
+        
+        # Process videos and animated content
+        if isinstance(message.media, MessageMediaDocument):
+            # Check MIME type to distinguish videos from other documents
+            mime_type = message.media.document.mime_type
+            if mime_type and mime_type.startswith('video/'):
+                return True
+        
+        return False
+    
+    async def _get_checkpoint(self, account_id: int, chat_id: int):
+        """
+        Retrieves the last processed message ID for a chat from the database.
+        Returns None if this chat has never been scanned.
+        """
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT last_processed_message_id 
+                FROM scan_checkpoints 
+                WHERE account_id = %s AND chat_id = %s
+            """, (account_id, chat_id))
+            
+            result = cursor.fetchone()
+            return result[0] if result else None
+    
+    async def _update_checkpoint(self, account_id: int, chat_id: int, message_id: int):
+        """
+        Updates the checkpoint table with the most recently processed message.
+        Uses INSERT ON CONFLICT to handle both new chats and existing checkpoints.
+        """
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO scan_checkpoints 
+                    (account_id, chat_id, last_processed_message_id, last_updated)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (account_id, chat_id) 
+                DO UPDATE SET 
+                    last_processed_message_id = EXCLUDED.last_processed_message_id,
+                    last_updated = CURRENT_TIMESTAMP
+            """, (account_id, chat_id, message_id))
+            conn.commit()
+    
+    async def _get_chat_message_count(self, chat_id: int) -> int:
+        """
+        Retrieves total message count for progress calculation.
+        This is an approximation as Telegram does not guarantee exact counts.
+        """
+        try:
+            # GetHistory with limit 0 returns count without fetching messages
+            result = await self.client.get_messages(chat_id, limit=0)
+            return result.total
+        except Exception as e:
+            logger.warning(f"Could not get message count for chat {chat_id}: {e}")
+            return 0
+    
+    async def _mark_chat_complete(self, account_id: int, chat_id: int):
+        """
+        Marks a chat as having completed backfill and ready for real-time mode.
+        """
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE scan_checkpoints 
+                SET scan_mode = 'realtime'
+                WHERE account_id = %s AND chat_id = %s
+            """, (account_id, chat_id))
+            conn.commit()
+```
+
+The checkpoint mechanism embedded in this implementation ensures that the system can recover gracefully from interruptions. If the container restarts mid-scan, the next execution queries the checkpoint table and resumes from the last successfully processed message rather than starting over. This resilience is essential for a system that might spend days processing large channels with millions of messages.
+
+**Real-Time Mode for Ongoing Monitoring**
+
+After backfill completes, the scanner transitions to real-time mode where it monitors for new messages as they arrive. This mode uses Telethon's event system to receive notifications when new messages appear in monitored chats.
+
+```python
+from telethon import events
+
+class RealtimeScanner:
+    """
+    Monitors chats for new messages in real-time using Telethon's event system.
+    Processes new media as it arrives without requiring polling.
+    """
+    
+    def __init__(self, client: TelegramClient, db_pool):
+        self.client = client
+        self.db_pool = db_pool
+        self.monitored_chats = set()
+    
+    async def start_monitoring(self, chat_ids: list):
+        """
+        Begins real-time monitoring of specified chats.
+        Registers event handlers that trigger when new messages arrive.
+        
+        Args:
+            chat_ids: List of Telegram chat identifiers to monitor
+        """
+        self.monitored_chats = set(chat_ids)
+        
+        @self.client.on(events.NewMessage(chats=chat_ids))
+        async def handle_new_message(event):
+            """
+            Event handler triggered when a new message arrives in a monitored chat.
+            """
+            message = event.message
+            
+            # Only process messages containing media
+            if not await self._should_process_message(message):
+                return
+            
+            logger.info(f"New media detected in chat {event.chat_id}, message {message.id}")
+            
+            # Find which account is monitoring this chat
+            account_id = await self._get_account_for_chat(event.chat_id)
+            
+            # Queue for processing
+            await self._queue_for_processing(message, account_id, event.chat_id)
+            
+            # Update checkpoint to reflect this message was processed
+            await self._update_checkpoint(account_id, event.chat_id, message.id)
+        
+        logger.info(f"Real-time monitoring started for {len(chat_ids)} chats")
+    
+    async def _should_process_message(self, message) -> bool:
+        """
+        Same filtering logic as backfill mode to maintain consistency.
+        """
+        if not message.media:
+            return False
+        
+        if isinstance(message.media, MessageMediaPhoto):
+            return True
+        
+        if isinstance(message.media, MessageMediaDocument):
+            mime_type = message.media.document.mime_type
+            if mime_type and mime_type.startswith('video/'):
+                return True
+        
+        return False
+```
+
+The event-based approach for real-time monitoring is significantly more efficient than polling. Instead of repeatedly querying Telegram for new messages, the client maintains a persistent connection and receives push notifications when relevant events occur. This reduces network overhead and ensures minimal latency between message arrival and processing.
+
+### 2.3 Media Download Manager
+
+The download manager sits between the message scanner and the processing pipeline, handling the actual transfer of media content from Telegram's servers into your application's memory. This component must carefully manage memory consumption while maintaining high throughput.
+
+The manager implements size-based filtering before initiating downloads. Telegram's message metadata includes file size information, allowing the manager to reject oversized files without wasting bandwidth. This prevents a single enormous video from consuming all available memory and crashing the application.
+
+```python
+import io
+import os
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MediaDownloadManager:
+    """
+    Manages downloading media from Telegram into memory buffers.
+    Implements size limits and retry logic for resilient operation.
+    """
+    
+    def __init__(self, client: TelegramClient):
+        self.client = client
+        self.max_size_mb = int(os.getenv('MAX_MEDIA_SIZE_MB', '200'))
+        self.max_size_bytes = self.max_size_mb * 1024 * 1024
+    
+    async def download_media(self, message) -> Optional[io.BytesIO]:
+        """
+        Downloads media from a Telegram message into an in-memory buffer.
+        
+        Returns None if the media exceeds size limits or download fails.
+        Returns BytesIO buffer containing the complete file on success.
+        
+        Args:
+            message: Telethon message object containing media
+        """
+        # Extract file size from message metadata
+        file_size = self._get_file_size(message)
+        
+        if file_size > self.max_size_bytes:
+            logger.warning(
+                f"Skipping oversized media: {file_size / 1024 / 1024:.2f}MB "
+                f"exceeds limit of {self.max_size_mb}MB"
+            )
+            return None
+        
+        logger.info(f"Downloading media: {file_size / 1024 / 1024:.2f}MB")
+        
+        try:
+            # Create an in-memory buffer to receive the download
+            buffer = io.BytesIO()
+            
+            # Download directly into the buffer
+            # Telethon streams the data in chunks, so even large files
+            # don't require allocating the entire size upfront
+            await message.download_media(file=buffer)
+            
+            # Reset buffer position to beginning for subsequent reads
+            buffer.seek(0)
+            
+            logger.info(f"Download complete: {file_size / 1024 / 1024:.2f}MB")
+            return buffer
+            
+        except Exception as e:
+            logger.error(f"Download failed for message {message.id}: {e}")
+            return None
+    
+    def _get_file_size(self, message) -> int:
+        """
+        Extracts file size from message media metadata.
+        Returns 0 if size cannot be determined.
+        """
+        if isinstance(message.media, MessageMediaPhoto):
+            # Photos don't have explicit size, estimate based on largest size variant
+            # Telegram stores multiple resolutions, we want the original
+            if message.media.photo.sizes:
+                # The last size is typically the largest
+                largest = message.media.photo.sizes[-1]
+                if hasattr(largest, 'size'):
+                    return largest.size
+            # If no size info, assume reasonable default
+            return 5 * 1024 * 1024  # 5MB estimate
+        
+        elif isinstance(message.media, MessageMediaDocument):
+            return message.media.document.size
+        
+        return 0
+```
+
+The BytesIO buffer serves as a virtual file that exists entirely in memory. When Telethon downloads media, it writes the data into this buffer exactly as it would write to a file on disk, but without any disk I/O occurring. This buffer can then be passed to other components that expect file-like objects, such as PyAV for video decoding or PIL for image manipulation. The interface remains identical to file-based processing, but the implementation avoids all disk operations.
+
+Memory management becomes critical when processing multiple files concurrently. If your system is processing ten videos simultaneously, each consuming one hundred megabytes, you have allocated one gigabyte of memory purely for media buffers. The download manager must coordinate with the processing pipeline to ensure that memory consumption remains within your sixteen gigabyte budget.
+
+### 2.4 Face Detection and Embedding Extraction
+
+The face detection component transforms raw pixel data into structured biometric information. This is where computer vision and machine learning enter your pipeline, converting images into the numerical representations that enable similarity comparison and clustering.
+
+InsightFace provides a high-level API that handles the complex details of face detection, alignment, and embedding generation. Understanding what happens inside this black box helps you make informed decisions about quality thresholds and error handling.
+
+```python
+import numpy as np
+from insightface.app import FaceAnalysis
+import os
+import logging
+from typing import List, Optional
+import asyncio
+
+logger = logging.getLogger(__name__)
+
+class FaceProcessor:
+    """
+    Detects faces in images and generates embedding vectors.
+    Uses InsightFace with buffalo_l model for high accuracy.
+    """
+    
+    def __init__(self):
+        # Initialize the model once during startup
+        # This is expensive (loads ~100MB of model weights) so we do it once
+        self.face_app = FaceAnalysis(
+            name='buffalo_l',
+            providers=['CPUExecutionProvider']  # Use CPU, GPU requires different setup
+        )
+        
+        # Prepare the model with specific detection parameters
+        # det_size controls the input resolution for face detection
+        # Higher values improve accuracy but slow down processing
+        self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+        
+        logger.info("Face detection model loaded successfully")
+    
+    async def process_image(self, image_array: np.ndarray) -> List[dict]:
+        """
+        Detects faces in an image and extracts embeddings.
+        
+        This is a CPU-intensive operation that can block the event loop.
+        We run it in a thread pool to keep the asyncio loop responsive.
+        
+        Args:
+            image_array: NumPy array in BGR format (OpenCV standard)
+        
+        Returns:
+            List of dictionaries, each containing:
+                - embedding: 512-dimensional vector
+                - bbox: Bounding box coordinates [x1, y1, x2, y2]
+                - quality: Detection confidence score
+                - landmarks: Facial feature points
+        """
+        # Offload CPU-intensive work to thread pool
+        loop = asyncio.get_event_loop()
+        faces = await loop.run_in_executor(None, self._detect_faces, image_array)
+        
+        return faces
+    
+    def _detect_faces(self, image_array: np.ndarray) -> List[dict]:
+        """
+        Synchronous face detection called from thread pool.
+        This method blocks but doesn't freeze the event loop.
+        """
+        try:
+            # InsightFace returns a list of Face objects
+            detected_faces = self.face_app.get(image_array)
+            
+            if not detected_faces:
+                logger.debug("No faces detected in image")
+                return []
+            
+            logger.info(f"Detected {len(detected_faces)} face(s)")
+            
+            # Convert InsightFace Face objects to dictionaries
+            processed_faces = []
+            for face in detected_faces:
+                face_data = {
+                    'embedding': face.normed_embedding.tolist(),  # Convert numpy to list
+                    'bbox': face.bbox.tolist(),
+                    'quality': float(face.det_score),  # Detection confidence
+                    'landmarks': face.landmark_2d_106.tolist() if hasattr(face, 'landmark_2d_106') else None
+                }
+                processed_faces.append(face_data)
+            
+            return processed_faces
+            
+        except Exception as e:
+            logger.error(f"Face detection failed: {e}")
+            return []
+```
+
+The InsightFace model performs several operations internally. First, it runs a face detection network that scans the image at multiple scales to locate all faces regardless of size. This detector outputs bounding boxes indicating where faces appear in the image. Second, it applies facial alignment, rotating and scaling each detected face to a standardized orientation. This normalization is critical because the embedding network expects faces to be approximately centered and upright. Third, it runs the embedding network, which is a deep convolutional neural network that has been trained to produce similar outputs for the same person under different conditions and different outputs for different people.
+
+The quality score deserves particular attention. This value reflects the detector's confidence that the bounding box actually contains a face. Scores near one indicate high confidence with clear, well-lit faces photographed straight-on. Scores below 0.5 suggest uncertain detections that might be false positives or severely degraded faces. Your system should use this quality score to filter out poor detections before storing embeddings in the database. Storing low-quality embeddings pollutes your dataset and degrades matching accuracy because these embeddings are noisier and less representative of the person's true appearance.
+
+The thread pool execution pattern is essential for maintaining system responsiveness. Face detection can take anywhere from fifty milliseconds for small images to several seconds for high-resolution photos with multiple faces. If this computation occurs directly in the asyncio event loop, it blocks all other operations. Network communication with Telegram stalls, database queries queue up, and the entire application freezes. By running face detection in a separate thread, the event loop continues handling I/O operations while the CPU churns through the computer vision computations.
+
+### 2.5 Video Frame Extraction
+
+Video processing introduces additional complexity because videos are not directly processable by face detection models. The models expect static images, so videos must be decomposed into individual frames. The strategy for selecting which frames to extract significantly impacts both processing efficiency and detection completeness.
+
+The adaptive extraction approach balances these competing concerns by adjusting extraction strategy based on video characteristics. Short videos receive dense frame sampling to ensure brief face appearances are captured. Long videos use sparser sampling to avoid processing thousands of redundant frames.
+
+```python
+import av
+import numpy as np
+import os
+import logging
+from typing import List, Optional
+import asyncio
+
+logger = logging.getLogger(__name__)
+
+class VideoFrameExtractor:
+    """
+    Extracts frames from video buffers for face detection.
+    Implements adaptive extraction based on video length and type.
+    """
+    
+    def __init__(self):
+        self.short_video_threshold = 30  # seconds
+        self.frame_interval = float(os.getenv('VIDEO_FRAME_RATE', '1.0'))  # frames per second
+    
+    async def extract_frames(self, video_buffer: io.BytesIO, is_round_video: bool = False) -> List[np.ndarray]:
+        """
+        Extracts frames from a video buffer using adaptive strategy.
+        
+        Args:
+            video_buffer: BytesIO containing video file data
+            is_round_video: Whether this is a Telegram round video message
+        
+        Returns:
+            List of NumPy arrays, each representing a frame in BGR format
+        """
+        # Offload video decoding to thread pool since it's CPU-intensive
+        loop = asyncio.get_event_loop()
+        frames = await loop.run_in_executor(
+            None, 
+            self._extract_frames_sync, 
+            video_buffer, 
+            is_round_video
+        )
+        
+        return frames
+    
+    def _extract_frames_sync(self, video_buffer: io.BytesIO, is_round_video: bool) -> List[np.ndarray]:
+        """
+        Synchronous frame extraction called from thread pool.
+        """
+        frames = []
+        
+        try:
+            # Open video container from memory buffer
+            # PyAV treats the BytesIO buffer like a file
+            container = av.open(video_buffer)
+            
+            # Get video stream metadata
+            video_stream = container.streams.video[0]
+            duration = float(video_stream.duration * video_stream.time_base)
+            fps = float(video_stream.average_rate)
+            
+            logger.info(f"Video metadata: {duration:.2f}s duration, {fps:.2f} fps")
+            
+            # Determine extraction strategy based on video characteristics
+            if is_round_video:
+                # Round videos are short and show a person speaking
+                # Extract densely (2 frames per second) for better coverage
+                frames = self._extract_fixed_rate(container, 2.0)
+            elif duration <= self.short_video_threshold:
+                # Short videos get fixed-rate extraction
+                frames = self._extract_fixed_rate(container, self.frame_interval)
+            else:
+                # Long videos try keyframe extraction first
+                frames = self._extract_keyframes(container)
+                
+                # Verify keyframe spacing is adequate
+                if len(frames) > 0:
+                    frame_spacing = duration / len(frames)
+                    if frame_spacing > 2.0:
+                        # Keyframes are too sparse, fall back to fixed rate
+                        logger.info("Keyframe spacing too large, using fixed-rate extraction")
+                        container.seek(0)  # Reset to beginning
+                        frames = self._extract_fixed_rate(container, self.frame_interval)
+            
+            container.close()
+            logger.info(f"Extracted {len(frames)} frames from video")
+            
+        except Exception as e:
+            logger.error(f"Frame extraction failed: {e}")
+            frames = []
+        
+        return frames
+    
+    def _extract_keyframes(self, container) -> List[np.ndarray]:
+        """
+        Extracts only I-frames (keyframes) from the video.
+        This is faster than decoding all frames but may miss content.
+        """
+        frames = []
+        video_stream = container.streams.video[0]
+        
+        # Configure decoder to skip non-keyframes
+        video_stream.codec_context.skip_frame = 'NONKEY'
+        
+        for frame in container.decode(video_stream):
+            if frame.key_frame:
+                # Convert PyAV frame to NumPy array in BGR format
+                img_array = frame.to_ndarray(format='bgr24')
+                frames.append(img_array)
+        
+        return frames
+    
+    def _extract_fixed_rate(self, container, fps: float) -> List[np.ndarray]:
+        """
+        Extracts frames at a fixed rate (e.g., 1 frame per second).
+        More reliable than keyframe extraction but slower.
+        """
+        frames = []
+        video_stream = container.streams.video[0]
+        duration = float(video_stream.duration * video_stream.time_base)
+        
+        # Calculate timestamps where we want frames
+        interval = 1.0 / fps
+        timestamps = np.arange(0, duration, interval)
+        
+        for timestamp in timestamps:
+            try:
+                # Seek to the desired timestamp
+                # PyAV finds the nearest seekable point and decodes from there
+                container.seek(int(timestamp / video_stream.time_base))
+                
+                # Decode frames until we reach the target timestamp
+                for frame in container.decode(video_stream):
+                    frame_time = float(frame.pts * video_stream.time_base)
+                    
+                    if frame_time >= timestamp:
+                        img_array = frame.to_ndarray(format='bgr24')
+                        frames.append(img_array)
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Failed to extract frame at {timestamp}s: {e}")
+                continue
+        
+        return frames
+```
+
+The distinction between keyframe and fixed-rate extraction reflects a fundamental trade-off in video processing. Keyframes are complete images that the video encoder stores independently. The frames between keyframes are stored as deltas describing how the image changes. Decoding a non-keyframe requires first decoding the most recent keyframe and then applying all the delta operations up to the desired frame. This makes keyframe-only decoding substantially faster because it avoids the delta computation.
+
+However, keyframe placement is controlled by the video encoder, not by your application. An encoder optimizing for file size might place keyframes only every three seconds to maximize compression. If someone appears in the video for two seconds between keyframes, keyframe-only extraction would miss them entirely. The fixed-rate extraction guarantees that you sample the video at known intervals regardless of encoder decisions, ensuring more reliable coverage at the cost of higher computational overhead.
+
+The round video special case recognizes that Telegram's circular video messages serve a specific use case. These are almost always selfie-style videos showing a single person speaking directly to the camera. They rarely exceed thirty seconds in length and typically contain exactly the type of clear, frontal face that your system wants to catalog. Extracting two frames per second from a twenty-second round video yields forty frames, which is computationally manageable while ensuring that the person's face is captured even if they move significantly during the recording.
+
+### 2.6 Processing Queue and Workflow Orchestration
+
+The components described so far operate as independent modules that each perform a specific transformation. The processing queue ties these modules together into a coherent workflow that efficiently processes media from discovery through database storage and topic upload.
+
+The queue acts as a buffer between message discovery and processing, decoupling these operations so they can proceed at different rates. The scanner might discover hundreds of messages per second when performing backfill of a large channel, but face detection can only process five to ten images per second. Without a queue, the scanner would need to wait for each image to complete processing before discovering the next message, severely limiting throughput. With a queue, the scanner rapidly discovers all messages and queues them for processing while worker tasks pull from the queue and process media at their maximum sustainable rate.
+
+```python
+import asyncio
+from asyncio import Queue
+from typing import Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ProcessingQueue:
+    """
+    Coordinates media processing workflow from download through database storage.
+    Implements producer-consumer pattern with configurable worker count.
+    """
+    
+    def __init__(
+        self, 
+        download_manager: MediaDownloadManager,
+        face_processor: FaceProcessor,
+        video_extractor: VideoFrameExtractor,
+        db_pool,
+        num_workers: int = 3
+    ):
+        self.download_manager = download_manager
+        self.face_processor = face_processor
+        self.video_extractor = video_extractor
+        self.db_pool = db_pool
+        
+        # Queue holds message objects waiting for processing
+        self.queue = Queue(maxsize=1000)
+        
+        # Track processing statistics
+        self.stats = {
+            'images_processed': 0,
+            'videos_processed': 0,
+            'faces_detected': 0,
+            'processing_errors': 0
+        }
+        
+        self.num_workers = num_workers
+        self.workers = []
+        self.running = False
+    
+    async def start(self):
+        """
+        Starts worker tasks that process queued messages.
+        Workers run concurrently, pulling messages from the queue.
+        """
+        self.running = True
+        
+        # Create worker tasks
+        for i in range(self.num_workers):
+            worker = asyncio.create_task(self._worker(i))
+            self.workers.append(worker)
+        
+        logger.info(f"Started {self.num_workers} processing workers")
+    
+    async def stop(self):
+        """
+        Gracefully stops all workers, allowing current tasks to complete.
+        """
+        self.running = False
+        
+        # Wait for all workers to finish current tasks
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        
+        logger.info("All processing workers stopped")
+    
+    async def enqueue(self, message, account_id: int, chat_id: int):
+        """
+        Adds a message to the processing queue.
+        Blocks if queue is full to prevent memory exhaustion.
+        """
+        await self.queue.put({
+            'message': message,
+            'account_id': account_id,
+            'chat_id': chat_id
+        })
+    
+    async def _worker(self, worker_id: int):
+        """
+        Worker task that processes messages from the queue.
+        Each worker operates independently, allowing concurrent processing.
+        """
+        logger.info(f"Worker {worker_id} started")
+        
+        while self.running or not self.queue.empty():
+            try:
+                # Get next message from queue with timeout
+                # Timeout allows worker to check self.running periodically
+                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                
+                message = item['message']
+                account_id = item['account_id']
+                chat_id = item['chat_id']
+                
+                logger.info(f"Worker {worker_id} processing message {message.id} from chat {chat_id}")
+                
+                # Execute processing pipeline
+                await self._process_message(message, account_id, chat_id)
+                
+                # Mark queue task as complete
+                self.queue.task_done()
+                
+            except asyncio.TimeoutError:
+                # Queue is empty, wait for more work
+                continue
+            except Exception as e:
+                logger.error(f"Worker {worker_id} encountered error: {e}")
+                self.stats['processing_errors'] += 1
+        
+        logger.info(f"Worker {worker_id} stopped")
+    
+    async def _process_message(self, message, account_id: int, chat_id: int):
+        """
+        Complete processing pipeline for a single message.
+        Downloads media, extracts faces, stores embeddings, uploads to topics.
+        """
+        try:
+            # Step 1: Download media into memory
+            media_buffer = await self.download_manager.download_media(message)
+            
+            if media_buffer is None:
+                logger.warning(f"Skipping message {message.id}: download failed")
+                return
+            
+            # Step 2: Extract frames if video, or process directly if image
+            frames = await self._get_processable_frames(message, media_buffer)
+            
+            if not frames:
+                logger.warning(f"No processable frames from message {message.id}")
+                media_buffer.close()
+                return
+            
+            # Step 3: Detect faces in all frames
+            all_faces = []
+            for frame in frames:
+                faces = await self.face_processor.process_image(frame)
+                all_faces.extend(faces)
+            
+            # Update statistics
+            if isinstance(message.media, MessageMediaPhoto):
+                self.stats['images_processed'] += 1
+            else:
+                self.stats['videos_processed'] += 1
+            
+            self.stats['faces_detected'] += len(all_faces)
+            
+            logger.info(f"Detected {len(all_faces)} total faces in message {message.id}")
+            
+            # Step 4: Filter by quality and deduplicate
+            quality_faces = self._filter_quality_faces(all_faces)
+            unique_faces = self._deduplicate_faces(quality_faces)
+            
+            # Step 5: Store embeddings and assign to topics
+            for face in unique_faces:
+                await self._process_face(face, message, chat_id)
+            
+            # Clean up memory
+            media_buffer.close()
+            
+        except Exception as e:
+            logger.error(f"Failed to process message {message.id}: {e}")
+            raise
+    
+    async def _get_processable_frames(self, message, media_buffer) -> List[np.ndarray]:
+        """
+        Extracts frames from media buffer, handling both images and videos.
+        """
+        from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+        
+        if isinstance(message.media, MessageMediaPhoto):
+            # Images are already complete frames
+            # Convert buffer to NumPy array
+            from PIL import Image
+            import io
+            
+            image = Image.open(media_buffer)
+            # Convert to BGR format (OpenCV/InsightFace standard)
+            image_array = np.array(image.convert('RGB'))[:, :, ::-1]
+            return [image_array]
+        
+        elif isinstance(message.media, MessageMediaDocument):
+            # Check if this is a round video
+            is_round = hasattr(message.media.document, 'attributes')
+            for attr in message.media.document.attributes:
+                if hasattr(attr, 'round_message') and attr.round_message:
+                    is_round = True
+                    break
+            
+            # Extract frames from video
+            frames = await self.video_extractor.extract_frames(media_buffer, is_round)
+            return frames
+        
+        return []
+    
+    def _filter_quality_faces(self, faces: List[dict], min_quality: float = 0.5) -> List[dict]:
+        """
+        Filters out low-quality face detections that would pollute the database.
+        """
+        return [face for face in faces if face['quality'] >= min_quality]
+    
+    def _deduplicate_faces(self, faces: List[dict]) -> List[dict]:
+        """
+        Removes duplicate detections of the same face across multiple frames.
+        Uses embedding similarity to identify duplicates.
+        """
+        if len(faces) <= 1:
+            return faces
+        
+        unique_faces = []
+        
+        for face in faces:
+            is_duplicate = False
+            
+            # Compare against already selected unique faces
+            for unique_face in unique_faces:
+                similarity = self._cosine_similarity(
+                    face['embedding'], 
+                    unique_face['embedding']
+                )
+                
+                # If very similar (>0.95), consider it a duplicate
+                if similarity > 0.95:
+                    is_duplicate = True
+                    # Keep the higher quality version
+                    if face['quality'] > unique_face['quality']:
+                        unique_faces.remove(unique_face)
+                        unique_faces.append(face)
+                    break
+            
+            if not is_duplicate:
+                unique_faces.append(face)
+        
+        logger.info(f"Deduplicated {len(faces)} faces to {len(unique_faces)} unique faces")
+        return unique_faces
+    
+    def _cosine_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
+        """
+        Computes cosine similarity between two embeddings.
+        Returns value between -1 and 1, where 1 means identical.
+        """
+        import numpy as np
+        
+        vec1 = np.array(embedding1)
+        vec2 = np.array(embedding2)
+        
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    async def _process_face(self, face: dict, message, chat_id: int):
+        """
+        Handles a single detected face: database storage and topic assignment.
+        This will be implemented in Part 3 (Database Operations).
+        """
+        # Placeholder - detailed implementation in next document
+        pass
+```
+
+The worker pattern implemented here allows the system to scale its processing capacity by adjusting the number of workers. With three workers, you can process three messages concurrently, tripling throughput compared to sequential processing. The optimal worker count depends on your hardware. More workers increase concurrency but also increase memory pressure since each worker holds a media buffer and potentially multiple decoded frames in memory simultaneously. For your sixteen gigabyte memory constraint, three to five workers represents a reasonable balance.
+
+The deduplication logic addresses a specific problem that emerges when processing videos. A person who remains in frame for several seconds will appear in multiple extracted frames, generating many nearly-identical embeddings. Storing all of these embeddings wastes database space and skews clustering because this person is over-represented compared to others who appear briefly. By computing similarity between embeddings extracted from the same video and removing duplicates, you ensure that each piece of media contributes at most one embedding per unique person, regardless of how many frames were processed.
+
+---
+
+**End of Part 2**

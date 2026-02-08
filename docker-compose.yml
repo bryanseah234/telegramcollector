@@ -1,0 +1,205 @@
+# Docker Compose for Telegram Face Recognition System
+# All services with health checks, resource limits, and persistence
+
+services:
+  # PostgreSQL database with pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: face_archiver_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-face_archiver}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-face_archiver}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Redis for task queue and caching
+  redis:
+    image: redis:alpine
+    container_name: face_archiver_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Main application worker
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face_archiver_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - TG_API_ID=${TG_API_ID}
+      - TG_API_HASH=${TG_API_HASH}
+      - HUB_GROUP_ID=${HUB_GROUP_ID}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-face_archiver}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.55}
+      - MIN_QUALITY_THRESHOLD=${MIN_QUALITY_THRESHOLD:-0.5}
+      - MAX_MEDIA_SIZE_MB=${MAX_MEDIA_SIZE_MB:-50}
+      - NUM_WORKERS=${NUM_WORKERS:-3}
+      - USE_GPU=${USE_GPU:-false}
+      - RUN_MODE=${RUN_MODE:-both}
+      - ACCOUNT_ID=${ACCOUNT_ID:-1}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./sessions:/app/sessions
+      - update_signal:/app/signals
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Login Bot - handles user account registration
+  login_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face_archiver_login_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python login_bot.py
+    environment:
+      - TG_API_ID=${TG_API_ID}
+      - TG_API_HASH=${TG_API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-face_archiver}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme}
+    volumes:
+      - ./sessions:/app/sessions
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face_archiver_dashboard
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-face_archiver}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - HUB_GROUP_ID=${HUB_GROUP_ID}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.55}
+      - USE_GPU=${USE_GPU:-false}
+    ports:
+      - "8501:8501"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Update checker (monitors GitHub for changes)
+  update_checker:
+    image: alpine:latest
+    container_name: face_archiver_updater
+    restart: unless-stopped
+    environment:
+      - GITHUB_REPO=${GITHUB_REPO:-}
+      - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
+      - CHECK_INTERVAL=${UPDATE_CHECK_INTERVAL:-1800}
+    volumes:
+      - ./update_checker.sh:/app/update_checker.sh:ro
+      - update_signal:/app/signals
+    command: /bin/sh /app/update_checker.sh
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+        reservations:
+          memory: 16M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+    name: face_archiver_postgres
+  update_signal:
+    name: face_archiver_signals
+  redis_data:
+    name: face_archiver_redis_data

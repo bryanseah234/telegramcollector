@@ -1,0 +1,1295 @@
+# Product Requirements Document: Telegram Face Recognition Archival System
+
+## Part 5: Deployment, Configuration, and Operations
+
+### 5.1 Understanding the Deployment Philosophy
+
+Before diving into the specific configuration files and deployment procedures, it is valuable to understand the architectural philosophy that guides how this system should be deployed and operated. This understanding will help you make informed decisions when adapting the deployment to your specific environment and when troubleshooting issues that inevitably arise in production systems.
+
+The deployment strategy embraces containerization as the primary mechanism for achieving consistency across different environments. Containers solve a fundamental problem in software deployment where applications that work perfectly on a developer's laptop fail mysteriously when deployed to a server. This happens because the runtime environment differs in subtle ways: different versions of system libraries, different Python package versions, different configurations of supporting services like databases. Containers package the entire runtime environment along with the application code, ensuring that what runs in development is byte-for-byte identical to what runs in production.
+
+Docker Compose orchestrates multiple containers that work together to provide your complete system. Your application does not consist of a single monolithic service but rather several cooperating components: the processing pipeline, the PostgreSQL database, the Streamlit dashboard, and optionally the update checker. Each component runs in its own container with clearly defined interfaces for communication. This separation provides isolation where failures in one component do not cascade to others, and it enables independent scaling where you could run multiple processing workers while maintaining a single database instance.
+
+The deployment prioritizes operational simplicity because this system is designed to run continuously for extended periods with minimal intervention. Once configured and started, the system should operate autonomously, processing messages as they arrive and recovering gracefully from transient failures like network interruptions or rate limiting. The deployment configuration includes health checks, automatic restart policies, and graceful shutdown handling to achieve this autonomous operation. Your role as an operator should be monitoring the system through the dashboard and occasionally intervening to perform manual corrections, not constantly restarting failed services or debugging container crashes.
+
+The update mechanism implements a continuous delivery pattern where code changes flow automatically from your development environment through version control to production deployment. When you commit changes to your repository, a continuous integration pipeline builds a new Docker image and pushes it to a registry. The update checker running in production detects this new image and orchestrates a controlled update that minimizes disruption to ongoing processing. This automation eliminates the manual deployment steps that are error-prone and time-consuming while ensuring that security updates and bug fixes reach production quickly.
+
+### 5.2 Docker Image Construction
+
+The Dockerfile defines how to build a container image that contains your application and all its dependencies. Understanding each section of the Dockerfile helps you customize it for your specific needs and troubleshoot build failures when they occur. The multi-stage build pattern used here separates the build environment from the runtime environment, keeping the final image size minimal by excluding build tools and intermediate artifacts.
+
+```dockerfile
+# Stage 1: Builder
+# This stage contains all the tools needed to compile Python packages
+# but these tools won't be included in the final image
+FROM python:3.11-slim as builder
+
+# Install system dependencies required for building Python packages
+# These include compilers, headers, and development libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libavfilter-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# The --no-install-recommends flag prevents apt from installing
+# suggested packages that aren't strictly necessary, reducing image size
+# The rm command cleans up apt cache to further reduce size
+
+WORKDIR /build
+
+# Copy only requirements first for better Docker layer caching
+# If requirements.txt doesn't change, Docker reuses the cached layer
+# even if application code changes, speeding up rebuilds
+COPY requirements.txt .
+
+# Install Python packages to a user directory
+# The --user flag installs to /root/.local which we'll copy to the runtime stage
+# The --no-cache-dir flag prevents pip from storing downloaded packages
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime
+# This stage contains only what's needed to run the application
+FROM python:3.11-slim
+
+# Install only runtime libraries (not development headers)
+# These are the shared libraries that the compiled Python packages need
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libavformat59 \
+    libavcodec59 \
+    libavdevice59 \
+    libavutil57 \
+    libswscale6 \
+    libswresample4 \
+    libavfilter8 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages from builder stage
+# This brings over all the compiled packages without the build tools
+COPY --from=builder /root/.local /root/.local
+
+# Set PATH to include the user install directory
+# This ensures Python can find the packages we installed
+ENV PATH=/root/.local/bin:$PATH
+
+# Prevent Python from buffering stdout/stderr
+# This ensures log messages appear immediately in Docker logs
+ENV PYTHONUNBUFFERED=1
+
+# Set the working directory where application code will live
+WORKDIR /app
+
+# Copy application code into the container
+# This happens late in the Dockerfile so code changes don't invalidate
+# the expensive package installation layers above
+COPY . .
+
+# Download InsightFace models during build
+# This ensures the models are baked into the image rather than
+# downloaded on every container startup, which would waste bandwidth
+# and slow down initialization
+RUN python -c "from insightface.app import FaceAnalysis; \
+    app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); \
+    app.prepare(ctx_id=0, det_size=(640, 640))"
+
+# The CMD specifies the default command to run when the container starts
+# This can be overridden in docker-compose for different services
+CMD ["python", "main.py"]
+```
+
+The requirements.txt file lists all Python package dependencies with version constraints. Pinning versions ensures reproducible builds where the same Dockerfile produces identical images regardless of when it is built. Without version pinning, building the image today might install different package versions than building it next month, potentially introducing subtle bugs or incompatibilities.
+
+```
+# requirements.txt
+
+# Telegram client library
+telethon==1.34.0
+
+# Face recognition and computer vision
+insightface==0.7.3
+onnxruntime==1.16.3
+opencv-python-headless==4.8.1.78
+
+# Video processing
+av==11.0.0
+
+# Database and vector operations
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+
+# Dashboard and visualization
+streamlit==1.29.0
+plotly==5.18.0
+pandas==2.1.4
+pillow==10.1.0
+
+# Utilities
+python-dotenv==1.0.0
+```
+
+The opencv-python-headless variant is specifically chosen because it excludes GUI components that are unnecessary in a server environment and would increase image size without providing any benefit. The psycopg2-binary package is similarly chosen over the source distribution because it includes pre-compiled bindings, eliminating the need for PostgreSQL development headers in the build environment.
+
+### 5.3 Docker Compose Orchestration
+
+The docker-compose.yml file defines how multiple containers work together to form your complete system. Each service in this file becomes a separate container, and Docker Compose handles networking between them, volume management for persistent data, and coordinated startup and shutdown. Understanding the purpose and configuration of each service helps you customize the deployment for your specific infrastructure.
+
+```yaml
+version: '3.8'
+
+# Named volumes provide persistent storage that survives container recreation
+# These volumes are managed by Docker and stored in /var/lib/docker/volumes
+volumes:
+  postgres_data:
+    # Database files persist here across container restarts
+  session_data:
+    # Telegram session files persist here
+  app_data:
+    # Application state, checkpoints, and temporary files
+
+# Custom network for inter-container communication
+# Services on the same network can reach each other by service name
+networks:
+  face_archiver_network:
+    driver: bridge
+
+services:
+  # PostgreSQL database with pgvector extension
+  postgres:
+    image: ankane/pgvector:latest
+    # This image includes PostgreSQL with pgvector pre-installed
+    # Using a specific image ensures the extension is available
+    
+    container_name: face_archiver_db
+    
+    restart: unless-stopped
+    # Container automatically restarts unless manually stopped
+    # Handles crashes and system reboots gracefully
+    
+    environment:
+      # Database configuration via environment variables
+      POSTGRES_DB: face_archiver
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # The password comes from an .env file for security
+      # Never hardcode credentials in docker-compose.yml
+      
+      # Performance tuning for face embedding workload
+      # These settings optimize PostgreSQL for vector operations
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+      
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Database files persist in named volume
+      
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      # Initialization script runs once when database is first created
+      # Sets up schema, indexes, and initial data
+    
+    networks:
+      - face_archiver_network
+    
+    healthcheck:
+      # Docker checks if PostgreSQL is ready to accept connections
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # The application won't start until database is healthy
+    
+    # Expose port for external database tools (optional)
+    # Remove this in production for security
+    ports:
+      - "5432:5432"
+
+  # Main application service - processing pipeline
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Builds from Dockerfile in current directory
+    
+    container_name: face_archiver_app
+    
+    restart: unless-stopped
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Won't start until PostgreSQL is ready
+      # Prevents connection errors during startup
+    
+    environment:
+      # Telegram credentials
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      
+      # Database connection
+      POSTGRES_HOST: postgres
+      # Use service name as hostname - Docker DNS resolves this
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: face_archiver
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      
+      # Hub group configuration
+      HUB_GROUP_ID: ${HUB_GROUP_ID}
+      
+      # Processing parameters
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.55}
+      # Default to 0.55 if not specified in .env
+      MIN_QUALITY_THRESHOLD: ${MIN_QUALITY_THRESHOLD:-0.5}
+      MAX_MEDIA_SIZE_MB: ${MAX_MEDIA_SIZE_MB:-200}
+      VIDEO_FRAME_RATE: ${VIDEO_FRAME_RATE:-1.0}
+      
+      # Logging configuration
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    
+    volumes:
+      - session_data:/app/sessions
+      # Telegram session files persist across restarts
+      
+      - app_data:/app/data
+      # Application state and temporary files
+      
+      - ./update_flag:/app/update_flag
+      # Shared volume for update checker communication
+    
+    networks:
+      - face_archiver_network
+    
+    # Resource limits prevent the container from consuming all host resources
+    # Adjust these based on your hardware capabilities
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          # Limit to half of your 16GB to leave room for other services
+        reservations:
+          memory: 4G
+          # Guarantee at least 4GB is available
+
+  # Streamlit dashboard service
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    container_name: face_archiver_dashboard
+    
+    # Override the default CMD to run Streamlit instead
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    
+    restart: unless-stopped
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Dashboard needs database access but not the main app
+    
+    environment:
+      # Database connection (same as app service)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: face_archiver
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      
+      # Streamlit configuration
+      STREAMLIT_SERVER_HEADLESS: true
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: false
+    
+    volumes:
+      - session_data:/app/sessions:ro
+      # Read-only access to sessions for displaying account info
+      
+      - app_data:/app/data:ro
+      # Read-only access to application data
+    
+    networks:
+      - face_archiver_network
+    
+    ports:
+      - "8501:8501"
+      # Expose dashboard to host machine
+      # Access at http://localhost:8501
+    
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          # Dashboard needs less memory than processing pipeline
+
+  # Update checker service (optional)
+  update_checker:
+    image: alpine:latest
+    # Lightweight Alpine Linux for running bash scripts
+    
+    container_name: face_archiver_updater
+    
+    restart: unless-stopped
+    
+    environment:
+      GITHUB_REPO: ${GITHUB_REPO}
+      GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
+      UPDATE_CHECK_INTERVAL: ${UPDATE_CHECK_INTERVAL:-1800}
+      # Check every 30 minutes by default
+    
+    volumes:
+      - ./update_flag:/update_flag
+      # Shared volume to signal when updates are available
+      
+      - ./update_checker.sh:/update_checker.sh
+      # The script that checks for updates
+    
+    command: sh /update_checker.sh
+    
+    networks:
+      - face_archiver_network
+    
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          # Update checker needs very little memory
+```
+
+The depends_on configuration with health check conditions ensures that services start in the correct order and only when their dependencies are ready. Without this, the application might try to connect to PostgreSQL before the database has finished initializing, resulting in connection errors and failed startup. The health check mechanism provides a robust way to detect when PostgreSQL is truly ready to accept queries rather than just when the container has started.
+
+The volume mounts use different access modes depending on the service's needs. The main application service has read-write access to session and data volumes because it needs to create and update files. The dashboard service has read-only access because it only needs to query existing data, not modify it. This read-only mounting provides an additional safety layer preventing accidental data corruption from the dashboard.
+
+The resource limits prevent any single container from monopolizing system resources. If the face processing pipeline encounters a memory leak or tries to process an unexpectedly large video, the memory limit prevents it from consuming all available RAM and crashing the entire system. Docker enforces these limits strictly, killing containers that exceed their memory allocation. This fail-fast behavior is preferable to allowing unbounded memory consumption that would eventually crash the host system.
+
+### 5.4 Environment Configuration Template
+
+The .env file contains sensitive configuration values that should never be committed to version control. This file lives only on your deployment server and contains the specific credentials and settings for that environment. The template below shows the structure with placeholder values that you replace with your actual configuration.
+
+```bash
+# .env.template
+# Copy this file to .env and fill in your actual values
+# Never commit .env to version control - add it to .gitignore
+
+# ============================================
+# Telegram API Credentials
+# ============================================
+# Obtain these from https://my.telegram.org/apps
+# Create an application to get your API ID and Hash
+TG_API_ID=12345678
+TG_API_HASH=abcdef1234567890abcdef1234567890
+
+# ============================================
+# PostgreSQL Database Configuration
+# ============================================
+# Use a strong, randomly generated password
+# Generate with: openssl rand -base64 32
+POSTGRES_PASSWORD=your_secure_password_here
+
+# ============================================
+# Telegram Hub Group Configuration
+# ============================================
+# The supergroup where forum topics will be created
+# Find this by forwarding a message from the group to @userinfobot
+# The ID will be negative, like -1001234567890
+HUB_GROUP_ID=-1001234567890
+
+# ============================================
+# Processing Configuration
+# ============================================
+# Face matching similarity threshold (0.0 to 1.0)
+# Lower values are more inclusive but may create incorrect matches
+# Higher values are more strict but may miss valid matches
+SIMILARITY_THRESHOLD=0.55
+
+# Minimum quality score for storing embeddings (0.0 to 1.0)
+# Faces detected with lower quality are discarded
+MIN_QUALITY_THRESHOLD=0.5
+
+# Maximum media file size to process in megabytes
+# Files larger than this are skipped to prevent memory issues
+MAX_MEDIA_SIZE_MB=200
+
+# Frame extraction rate for videos (frames per second)
+# Higher values provide better coverage but slower processing
+VIDEO_FRAME_RATE=1.0
+
+# ============================================
+# Update Checker Configuration
+# ============================================
+# GitHub repository in format: username/repository
+GITHUB_REPO=yourusername/face-archiver
+
+# Branch to monitor for updates
+GITHUB_BRANCH=main
+
+# How often to check for updates (seconds)
+# 1800 = 30 minutes, 3600 = 1 hour
+UPDATE_CHECK_INTERVAL=1800
+
+# ============================================
+# Logging Configuration
+# ============================================
+# Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_LEVEL=INFO
+```
+
+The template includes detailed comments explaining each variable's purpose and how to obtain the required values. This documentation-as-configuration approach helps you and others understand what each setting does when revisiting the deployment months later. The comments also provide sensible default values and guidance on how to tune parameters for different scenarios.
+
+### 5.5 Database Initialization Script
+
+The init-db.sql script runs automatically when the PostgreSQL container first starts and creates a new database. This script sets up the schema, creates indexes, and enables the pgvector extension. Understanding this initialization process helps you modify the schema when adding new features or troubleshooting schema-related issues.
+
+```sql
+-- init-db.sql
+-- Database initialization script
+-- Runs once when PostgreSQL container is first created
+
+-- Enable pgvector extension for vector similarity search
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ============================================
+-- Table: telegram_accounts
+-- ============================================
+-- Tracks Telegram user accounts added to the system
+CREATE TABLE IF NOT EXISTS telegram_accounts (
+    id SERIAL PRIMARY KEY,
+    phone_number VARCHAR(20) UNIQUE NOT NULL,
+    session_file_path VARCHAR(255) NOT NULL,
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'paused', 'error')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_accounts_status ON telegram_accounts(status);
+CREATE INDEX idx_accounts_last_active ON telegram_accounts(last_active DESC);
+
+-- ============================================
+-- Table: telegram_topics
+-- ============================================
+-- Stores information about forum topics representing identities
+CREATE TABLE IF NOT EXISTS telegram_topics (
+    id SERIAL PRIMARY KEY,
+    topic_id BIGINT UNIQUE NOT NULL,
+    label VARCHAR(255) DEFAULT 'Unknown Person',
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    exemplar_image_url TEXT,
+    embedding_count INTEGER DEFAULT 0,
+    message_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX idx_topics_label ON telegram_topics(label);
+CREATE INDEX idx_topics_last_seen ON telegram_topics(last_seen DESC);
+CREATE INDEX idx_topics_embedding_count ON telegram_topics(embedding_count DESC);
+
+-- ============================================
+-- Table: face_embeddings
+-- ============================================
+-- Stores face embedding vectors with metadata
+CREATE TABLE IF NOT EXISTS face_embeddings (
+    id SERIAL PRIMARY KEY,
+    topic_id INTEGER REFERENCES telegram_topics(id) ON DELETE CASCADE,
+    embedding vector(512) NOT NULL,
+    source_chat_id BIGINT NOT NULL,
+    source_message_id BIGINT NOT NULL,
+    quality_score REAL DEFAULT 0.0 CHECK (quality_score >= 0.0 AND quality_score <= 1.0),
+    detection_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_embeddings_topic ON face_embeddings(topic_id);
+CREATE INDEX idx_embeddings_source ON face_embeddings(source_chat_id, source_message_id);
+CREATE INDEX idx_embeddings_quality ON face_embeddings(quality_score DESC);
+CREATE INDEX idx_embeddings_timestamp ON face_embeddings(detection_timestamp DESC);
+
+-- Create vector similarity search index
+-- This index dramatically speeds up nearest neighbor queries
+-- The lists parameter controls index granularity
+-- 1000 lists works well for databases with up to several million vectors
+CREATE INDEX idx_embeddings_vector ON face_embeddings 
+USING ivfflat (embedding vector_cosine_ops) 
+WITH (lists = 1000);
+
+-- ============================================
+-- Table: scan_checkpoints
+-- ============================================
+-- Tracks scanning progress for resumable processing
+CREATE TABLE IF NOT EXISTS scan_checkpoints (
+    id SERIAL PRIMARY KEY,
+    account_id INTEGER REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL,
+    chat_title VARCHAR(255),
+    last_processed_message_id BIGINT,
+    total_messages INTEGER DEFAULT 0,
+    processed_messages INTEGER DEFAULT 0,
+    scan_mode VARCHAR(20) DEFAULT 'backfill' CHECK (scan_mode IN ('backfill', 'realtime')),
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(account_id, chat_id)
+);
+
+CREATE INDEX idx_checkpoints_account ON scan_checkpoints(account_id);
+CREATE INDEX idx_checkpoints_mode ON scan_checkpoints(scan_mode);
+CREATE INDEX idx_checkpoints_last_updated ON scan_checkpoints(last_updated DESC);
+
+-- ============================================
+-- Table: uploaded_media
+-- ============================================
+-- Tracks which media has been uploaded to which topics
+-- Prevents duplicate uploads during restart/recovery
+CREATE TABLE IF NOT EXISTS uploaded_media (
+    id SERIAL PRIMARY KEY,
+    topic_id INTEGER REFERENCES telegram_topics(id) ON DELETE CASCADE,
+    source_message_id BIGINT NOT NULL,
+    source_chat_id BIGINT NOT NULL,
+    uploaded_message_id BIGINT NOT NULL,
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(topic_id, source_message_id, source_chat_id)
+);
+
+CREATE INDEX idx_uploaded_source ON uploaded_media(source_chat_id, source_message_id);
+CREATE INDEX idx_uploaded_topic ON uploaded_media(topic_id);
+
+-- ============================================
+-- Table: processing_metrics
+-- ============================================
+-- Stores time-series metrics for dashboard display
+CREATE TABLE IF NOT EXISTS processing_metrics (
+    id SERIAL PRIMARY KEY,
+    metric_name VARCHAR(100) NOT NULL,
+    metric_value BIGINT NOT NULL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_metrics_name_time ON processing_metrics(metric_name, recorded_at DESC);
+
+-- ============================================
+-- Table: processing_errors
+-- ============================================
+-- Logs errors for dashboard display and debugging
+CREATE TABLE IF NOT EXISTS processing_errors (
+    id SERIAL PRIMARY KEY,
+    error_type VARCHAR(100) NOT NULL,
+    error_message TEXT NOT NULL,
+    error_context JSONB,
+    error_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_errors_timestamp ON processing_errors(error_timestamp DESC);
+CREATE INDEX idx_errors_type ON processing_errors(error_type);
+
+-- ============================================
+-- Maintenance Functions
+-- ============================================
+
+-- Function to clean up old metrics (keep last 30 days)
+CREATE OR REPLACE FUNCTION cleanup_old_metrics()
+RETURNS void AS $$
+BEGIN
+    DELETE FROM processing_metrics 
+    WHERE recorded_at < NOW() - INTERVAL '30 days';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to update topic statistics
+CREATE OR REPLACE FUNCTION update_topic_stats(p_topic_id INTEGER)
+RETURNS void AS $$
+BEGIN
+    UPDATE telegram_topics t
+    SET 
+        embedding_count = (
+            SELECT COUNT(*) FROM face_embeddings WHERE topic_id = t.id
+        ),
+        message_count = (
+            SELECT COUNT(*) FROM uploaded_media WHERE topic_id = t.id
+        )
+    WHERE t.id = p_topic_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant necessary permissions
+-- In production, you might create a separate application user
+-- with limited permissions instead of using the postgres superuser
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres;
+```
+
+The initialization script includes CHECK constraints that enforce data validity at the database level. For example, the quality_score column must be between zero and one because that is the valid range for InsightFace quality scores. The scan_mode column must be either backfill or realtime because those are the only valid scanning modes. These constraints prevent application bugs from corrupting the database with invalid values.
+
+The utility functions defined at the end of the script provide maintenance operations that you can call manually or schedule through cron jobs. The cleanup_old_metrics function prevents the metrics table from growing indefinitely by removing data older than thirty days. The update_topic_stats function recalculates the denormalized counts when they drift out of sync due to manual database operations or bugs. These functions demonstrate PostgreSQL's capability to encapsulate complex operations in stored procedures that can be called from any database client.
+
+### 5.6 Update Checker Implementation
+
+The update checker provides automatic deployment of code changes without requiring manual intervention. This component runs as a separate service that periodically queries your GitHub repository to detect new commits. When updates are found, it signals the main application to perform a graceful shutdown, allowing Docker's restart policy to bring the containers back up with the updated code.
+
+```bash
+#!/bin/sh
+# update_checker.sh
+# Monitors GitHub repository for updates and signals application to restart
+
+set -e  # Exit on any error
+
+# Configuration from environment variables
+REPO="${GITHUB_REPO}"
+BRANCH="${GITHUB_BRANCH:-main}"
+INTERVAL="${UPDATE_CHECK_INTERVAL:-1800}"  # Default 30 minutes
+
+# File paths
+LAST_COMMIT_FILE="/update_flag/last_commit.txt"
+UPDATE_AVAILABLE_FILE="/update_flag/update_available"
+
+# Validate configuration
+if [ -z "$REPO" ]; then
+    echo "ERROR: GITHUB_REPO environment variable not set"
+    exit 1
+fi
+
+echo "Update checker started"
+echo "Repository: $REPO"
+echo "Branch: $BRANCH"
+echo "Check interval: $INTERVAL seconds"
+
+# Function to get latest commit hash from GitHub
+get_latest_commit() {
+    # GitHub API endpoint for repository commits
+    # This endpoint is publicly accessible and doesn't require authentication
+    # for public repositories
+    API_URL="https://api.github.com/repos/$REPO/commits/$BRANCH"
+    
+    # Use wget to fetch the API response
+    # -q for quiet mode (no progress bar)
+    # -O - to output to stdout
+    # Extract the SHA from JSON using simple text processing
+    wget -q -O - "$API_URL" | grep -o '"sha": *"[^"]*"' | head -1 | grep -o '[a-f0-9]\{40\}'
+}
+
+# Initialize last known commit if file doesn't exist
+if [ ! -f "$LAST_COMMIT_FILE" ]; then
+    echo "Initializing commit tracking"
+    CURRENT_COMMIT=$(get_latest_commit)
+    
+    if [ -z "$CURRENT_COMMIT" ]; then
+        echo "ERROR: Failed to fetch initial commit hash"
+        echo "Retrying in $INTERVAL seconds..."
+    else
+        echo "$CURRENT_COMMIT" > "$LAST_COMMIT_FILE"
+        echo "Initial commit: $CURRENT_COMMIT"
+    fi
+fi
+
+# Main monitoring loop
+while true; do
+    echo "Checking for updates..."
+    
+    # Fetch latest commit from GitHub
+    LATEST_COMMIT=$(get_latest_commit)
+    
+    if [ -z "$LATEST_COMMIT" ]; then
+        echo "WARNING: Failed to fetch latest commit (network issue?)"
+        echo "Retrying in $INTERVAL seconds..."
+        sleep "$INTERVAL"
+        continue
+    fi
+    
+    # Read last known commit
+    LAST_COMMIT=$(cat "$LAST_COMMIT_FILE")
+    
+    # Compare commits
+    if [ "$LATEST_COMMIT" != "$LAST_COMMIT" ]; then
+        echo "Update detected!"
+        echo "Previous commit: $LAST_COMMIT"
+        echo "Latest commit: $LATEST_COMMIT"
+        
+        # Update stored commit
+        echo "$LATEST_COMMIT" > "$LAST_COMMIT_FILE"
+        
+        # Signal that update is available
+        touch "$UPDATE_AVAILABLE_FILE"
+        
+        echo "Update flag set. Application will restart at next checkpoint."
+    else
+        echo "No updates available"
+    fi
+    
+    # Wait before next check
+    sleep "$INTERVAL"
+done
+```
+
+The update checker uses the GitHub API to retrieve commit information. This approach is simple and reliable, working without requiring authentication for public repositories. For private repositories, you would need to provide a GitHub personal access token through an additional environment variable and include it in the API request as a Bearer token header.
+
+The signaling mechanism uses a simple file flag in a shared volume. The update checker creates a file named update_available when it detects new commits. The main application periodically checks for the existence of this file and initiates a graceful shutdown when found. This simple approach avoids the complexity of inter-process communication mechanisms while providing reliable signaling across container boundaries.
+
+The main application needs corresponding code to check for the update flag and respond appropriately. This code integrates into the processing queue's checkpoint mechanism to ensure that updates only occur at safe points where no data is at risk of corruption.
+
+```python
+# update_handler.py
+# Integration with main application for handling updates
+
+import os
+import sys
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+UPDATE_FLAG_PATH = Path('/app/update_flag/update_available')
+
+def check_for_update() -> bool:
+    """
+    Checks if an update is available by looking for the flag file.
+    Returns True if update should be applied, False otherwise.
+    """
+    return UPDATE_FLAG_PATH.exists()
+
+def clear_update_flag():
+    """
+    Removes the update flag file after acknowledging it.
+    """
+    try:
+        if UPDATE_FLAG_PATH.exists():
+            UPDATE_FLAG_PATH.unlink()
+            logger.info("Update flag cleared")
+    except Exception as e:
+        logger.error(f"Failed to clear update flag: {e}")
+
+def perform_graceful_shutdown():
+    """
+    Performs cleanup operations before shutting down for update.
+    This function should be called when an update is detected.
+    """
+    logger.info("Update detected - initiating graceful shutdown")
+    
+    # Clear the update flag so we don't immediately shutdown again
+    clear_update_flag()
+    
+    # The processing queue's stop() method already handles cleanup
+    # We just need to exit cleanly
+    logger.info("Graceful shutdown complete - exiting for update")
+    
+    # Exit with status 0 to indicate clean shutdown
+    # Docker's restart policy will start the container with new code
+    sys.exit(0)
+```
+
+The graceful shutdown mechanism ensures that the application completes its current work before exiting. The processing queue's stop method waits for all worker tasks to finish processing their current messages, writes final checkpoints to the database, and closes all network connections cleanly. This prevents data loss or corruption that could occur from forcibly terminating the process mid-operation.
+
+### 5.7 Application Entry Point and Initialization
+
+The main.py file serves as the application's entry point, coordinating all the components described in previous sections into a cohesive system. This file handles initialization, starts the processing pipeline, and implements the main event loop that keeps the application running.
+
+```python
+# main.py
+# Application entry point - coordinates all components
+
+import asyncio
+import logging
+import signal
+import sys
+from pathlib import Path
+
+# Import application components
+from database import DatabasePool, db_pool, validate_configuration
+from telegram_client import MessageScanner, RealtimeScanner, TopicManager
+from media_processor import MediaDownloadManager, FaceProcessor, VideoFrameExtractor
+from identity_matcher import IdentityMatcher
+from media_uploader import MediaUploader
+from processing_queue import ProcessingQueue
+from update_handler import check_for_update, perform_graceful_shutdown
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/app/data/application.log')
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Global reference to processing queue for shutdown handler
+processing_queue = None
+
+def signal_handler(signum, frame):
+    """
+    Handles shutdown signals (SIGTERM, SIGINT) gracefully.
+    Docker sends SIGTERM when stopping containers.
+    """
+    logger.info(f"Received signal {signum} - initiating shutdown")
+    
+    if processing_queue:
+        # Stop the processing queue gracefully
+        asyncio.create_task(processing_queue.stop())
+
+async def initialize_components():
+    """
+    Initializes all application components with proper error handling.
+    Returns tuple of (client, components_dict) or (None, None) on failure.
+    """
+    logger.info("Initializing application components")
+    
+    try:
+        # Validate configuration first
+        validate_configuration()
+        
+        # Initialize Telegram client
+        from telethon import TelegramClient
+        import os
+        
+        api_id = int(os.getenv('TG_API_ID'))
+        api_hash = os.getenv('TG_API_HASH')
+        
+        client = TelegramClient(
+            '/app/sessions/userbot',
+            api_id,
+            api_hash,
+            system_version="4.16.30-vxCUSTOM"  # Custom version string
+        )
+        
+        # Start the client and ensure we're authorized
+        await client.start()
+        
+        if not await client.is_user_authorized():
+            logger.error("Telegram client is not authorized")
+            logger.error("Please run the initialization script to authorize the account")
+            return None, None
+        
+        logger.info("Telegram client initialized successfully")
+        
+        # Initialize processing components
+        download_manager = MediaDownloadManager(client)
+        face_processor = FaceProcessor()
+        video_extractor = VideoFrameExtractor()
+        identity_matcher = IdentityMatcher(db_pool)
+        topic_manager = TopicManager(client, db_pool)
+        media_uploader = MediaUploader(client, db_pool)
+        
+        # Create processing queue with all components
+        queue = ProcessingQueue(
+            download_manager=download_manager,
+            face_processor=face_processor,
+            video_extractor=video_extractor,
+            identity_matcher=identity_matcher,
+            topic_manager=topic_manager,
+            media_uploader=media_uploader,
+            db_pool=db_pool,
+            num_workers=3  # Configurable based on resources
+        )
+        
+        # Initialize scanners
+        message_scanner = MessageScanner(client, db_pool)
+        realtime_scanner = RealtimeScanner(client, db_pool)
+        
+        components = {
+            'queue': queue,
+            'message_scanner': message_scanner,
+            'realtime_scanner': realtime_scanner,
+            'topic_manager': topic_manager
+        }
+        
+        logger.info("All components initialized successfully")
+        return client, components
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize components: {e}")
+        return None, None
+
+async def get_monitored_chats():
+    """
+    Retrieves list of chats that should be monitored.
+    In a full implementation, this might query a configuration table
+    or read from a configuration file.
+    
+    For now, returns chats from scan_checkpoints that are in realtime mode.
+    """
+    from database import get_db_connection
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT chat_id 
+            FROM scan_checkpoints 
+            WHERE scan_mode = 'realtime'
+        """)
+        
+        return [row[0] for row in cursor.fetchall()]
+
+async def main_loop(client, components):
+    """
+    Main application loop that coordinates scanning and processing.
+    """
+    global processing_queue
+    processing_queue = components['queue']
+    
+    # Start processing queue workers
+    await processing_queue.start()
+    logger.info("Processing queue started")
+    
+    # Start real-time monitoring for completed scans
+    monitored_chats = await get_monitored_chats()
+    
+    if monitored_chats:
+        await components['realtime_scanner'].start_monitoring(monitored_chats)
+        logger.info(f"Real-time monitoring started for {len(monitored_chats)} chats")
+    
+    # Main event loop - checks for updates periodically
+    while True:
+        try:
+            # Check if update is available
+            if check_for_update():
+                logger.info("Update detected - preparing for graceful shutdown")
+                
+                # Stop processing queue gracefully
+                await processing_queue.stop()
+                
+                # Perform shutdown
+                perform_graceful_shutdown()
+                # This function exits, so code below never executes
+            
+            # Check processing queue health
+            if processing_queue.stats['processing_errors'] > 100:
+                logger.warning("High error count detected - consider investigating")
+            
+            # Sleep before next check
+            await asyncio.sleep(60)  # Check every minute
+            
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            await asyncio.sleep(60)
+
+async def main():
+    """
+    Application entry point - orchestrates initialization and main loop.
+    """
+    logger.info("=== Face Recognition Archive System Starting ===")
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Initialize all components
+    client, components = await initialize_components()
+    
+    if client is None or components is None:
+        logger.error("Failed to initialize - exiting")
+        sys.exit(1)
+    
+    try:
+        # Run main application loop
+        await main_loop(client, components)
+        
+    except Exception as e:
+        logger.error(f"Fatal error in main loop: {e}")
+        
+    finally:
+        # Cleanup
+        logger.info("Shutting down gracefully")
+        
+        if processing_queue:
+            await processing_queue.stop()
+        
+        if client:
+            await client.disconnect()
+        
+        db_pool.close_all()
+        
+        logger.info("Shutdown complete")
+
+if __name__ == "__main__":
+    # Run the async main function
+    asyncio.run(main())
+```
+
+The signal handler registration ensures that the application responds appropriately to shutdown signals from Docker. When you run docker-compose down or Docker needs to restart a container, it sends SIGTERM to give the application time to clean up. Without handling this signal, the container would be forcibly killed after a timeout, potentially corrupting data or leaving network connections in inconsistent states.
+
+The initialization sequence follows a specific order because later components depend on earlier ones. The database connection pool must be initialized before any database operations occur. The Telegram client must be connected and authorized before creating scanners or uploaders that use it. The processing components must exist before the processing queue that coordinates them. This careful ordering prevents initialization failures from subtle dependency issues.
+
+The main loop implements a simple but effective health monitoring pattern by checking the processing queue's error counter. If errors accumulate rapidly, something is fundamentally wrong and requires human investigation. The loop logs a warning but continues operating, allowing you to notice the issue through the logs or dashboard rather than having the application exit automatically.
+
+### 5.8 Deployment Procedures and Operations
+
+With all the code and configuration in place, you can now deploy the system. This section walks through the complete deployment process from a fresh server to a running application, including troubleshooting common issues and performing routine maintenance operations.
+
+The deployment begins by preparing your server environment. You need a Linux server with Docker and Docker Compose installed. The server should have adequate resources as specified earlier: at least sixteen gigabytes of RAM, multiple CPU cores for concurrent processing, and sufficient disk space for the Docker images and PostgreSQL database. A minimal installation on Ubuntu or Debian provides a clean foundation.
+
+After installing Docker, clone your repository to the server. The repository should contain all the code files described in previous sections along with the Dockerfile, docker-compose.yml, and initialization scripts. The .env file should not be in the repository since it contains secrets. You must create this file manually on the server with your actual credentials and configuration values.
+
+```bash
+# Initial deployment commands
+
+# Clone repository
+git clone https://github.com/yourusername/face-archiver.git
+cd face-archiver
+
+# Create environment file from template
+cp .env.template .env
+
+# Edit .env with your actual values
+nano .env
+# Fill in all required values, save and exit
+
+# Ensure update_flag directory exists
+mkdir -p update_flag
+
+# Build and start containers
+docker-compose up -d
+
+# View logs to confirm successful startup
+docker-compose logs -f
+
+# You should see logs from postgres, app, dashboard, and update_checker
+# Press Ctrl+C to stop following logs (containers keep running)
+```
+
+The first startup takes several minutes because Docker must build the application image. This process compiles Python packages, downloads the InsightFace models, and creates the final container image. Subsequent startups use the cached image and complete in seconds. The -d flag runs containers in detached mode, meaning they continue running in the background after the command completes.
+
+Monitoring the logs during initial startup helps you identify configuration errors quickly. Common issues include invalid Telegram credentials producing authentication errors, database connection failures due to incorrect passwords, or missing environment variables causing validation errors. The logs clearly indicate which component failed and why, allowing you to correct the issue and restart.
+
+After successful startup, you can verify that all services are running correctly:
+
+```bash
+# Check container status
+docker-compose ps
+
+# All containers should show "Up" status
+# If any show "Exit" or "Restarting", investigate their logs
+
+# Check database connectivity
+docker-compose exec postgres psql -U postgres -d face_archiver -c "SELECT COUNT(*) FROM telegram_topics;"
+
+# Should return 0 on fresh installation
+# Errors indicate database initialization problems
+
+# Access dashboard
+# Open browser to http://your-server-ip:8501
+# You should see the dashboard interface
+```
+
+Adding your first Telegram account requires interactive authentication that cannot be automated. The Telethon library needs to send an authentication code to your phone and receive your two-factor authentication password if enabled. You must run an initialization script that handles this interactive process before the main application can use the account.
+
+```python
+# init_account.py
+# Interactive script for adding Telegram accounts
+
+import asyncio
+from telethon import TelegramClient
+import os
+import sys
+
+async def initialize_account():
+    """
+    Interactively authenticates a Telegram account and saves session.
+    Run this script once for each account you want to add.
+    """
+    api_id = int(os.getenv('TG_API_ID'))
+    api_hash = os.getenv('TG_API_HASH')
+    
+    print("=== Telegram Account Initialization ===")
+    print("This script will authenticate your Telegram account")
+    print("and save the session for use by the main application.")
+    print()
+    
+    phone = input("Enter your phone number (with country code, e.g., +1234567890): ")
+    
+    session_path = f'/app/sessions/{phone.replace("+", "")}'
+    
+    client = TelegramClient(session_path, api_id, api_hash)
+    
+    await client.start(phone=phone)
+    
+    if await client.is_user_authorized():
+        print()
+        print("✓ Account authenticated successfully!")
+        print(f"Session saved to: {session_path}.session")
+        print()
+        print("You can now add this account to the database and start the main application.")
+        
+        # Get account information
+        me = await client.get_me()
+        print(f"Logged in as: {me.first_name} {me.last_name or ''}")
+        print(f"Username: @{me.username or 'none'}")
+        
+        # Add to database
+        from database import get_db_connection
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO telegram_accounts (phone_number, session_file_path, status)
+                VALUES (%s, %s, 'active')
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    session_file_path = EXCLUDED.session_file_path,
+                    status = 'active',
+                    last_active = CURRENT_TIMESTAMP
+            """, (phone, session_path + '.session'))
+            conn.commit()
+        
+        print("✓ Account added to database")
+        
+    else:
+        print("✗ Authentication failed")
+        sys.exit(1)
+    
+    await client.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(initialize_account())
+```
+
+You run this initialization script inside the app container where it has access to the database and session storage:
+
+```bash
+# Run account initialization
+docker-compose exec app python init_account.py
+
+# Follow the prompts to authenticate
+# The script sends a code to your Telegram app
+# Enter the code when prompted
+# Enter your 2FA password if enabled
+```
+
+After adding accounts, you can start scanning chats. The system does not automatically scan all chats that the account has access to because this could be thousands of chats consuming enormous resources. Instead, you explicitly tell the system which chats to scan by adding them to the scan_checkpoints table.
+
+```python
+# add_chat.py
+# Script for adding chats to scan
+
+import asyncio
+from telethon import TelegramClient
+import os
+
+async def add_chat_to_scan(account_id: int, chat_identifier: str):
+    """
+    Adds a chat to the scanning queue.
+    
+    Args:
+        account_id: Database ID of the account that should scan this chat
+        chat_identifier: Chat username, invite link, or numeric ID
+    """
+    from database import get_db_connection
+    
+    api_id = int(os.getenv('TG_API_ID'))
+    api_hash = os.getenv('TG_API_HASH'))
+    
+    # Get account session path
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT session_file_path FROM telegram_accounts WHERE id = %s", (account_id,))
+        session_path = cursor.fetchone()[0].replace('.session', '')
+    
+    client = TelegramClient(session_path, api_id, api_hash)
+    await client.start()
+    
+    try:
+        # Resolve the chat
+        chat = await client.get_entity(chat_identifier)
+        
+        print(f"Found chat: {chat.title}")
+        print(f"Chat ID: {chat.id}")
+        
+        # Add to database
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO scan_checkpoints 
+                    (account_id, chat_id, chat_title, scan_mode)
+                VALUES (%s, %s, %s, 'backfill')
+                ON CONFLICT (account_id, chat_id) DO NOTHING
+            """, (account_id, chat.id, chat.title))
+            conn.commit()
+        
+        print("✓ Chat added to scanning queue")
+        print("The application will begin scanning this chat automatically")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+    
+    await client.disconnect()
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) != 3:
+        print("Usage: python add_chat.py <account_id> <chat_identifier>")
+        print("Example: python add_chat.py 1 @channelname")
+        sys.exit(1)
+    
+    account_id = int(sys.argv[1])
+    chat_identifier = sys.argv[2]
+    
+    asyncio.run(add_chat_to_scan(account_id, chat_identifier))
+```
+
+Regular maintenance operations keep the system running smoothly over months of continuous operation. Database maintenance includes vacuuming to reclaim space from deleted records, reindexing to maintain query performance, and analyzing tables to update query planner statistics. These operations should run periodically through cron jobs or manual intervention during low-usage periods.
+
+```bash
+# Maintenance commands
+
+# Database vacuum and analyze
+docker-compose exec postgres psql -U postgres -d face_archiver -c "VACUUM ANALYZE;"
+
+# Check database size
+docker-compose exec postgres psql -U postgres -d face_archiver -c "
+    SELECT pg_size_pretty(pg_database_size('face_archiver')) as size;
+"
+
+# Clean old metrics (using the function from init-db.sql)
+docker-compose exec postgres psql -U postgres -d face_archiver -c "SELECT cleanup_old_metrics();"
+
+# View recent errors
+docker-compose exec postgres psql -U postgres -d face_archiver -c "
+    SELECT error_timestamp, error_type, error_message 
+    FROM processing_errors 
+    ORDER BY error_timestamp DESC 
+    LIMIT 10;
+"
+
+# Rebuild vector index if performance degrades
+docker-compose exec postgres psql -U postgres -d face_archiver -c "
+    REINDEX INDEX idx_embeddings_vector;
+"
+
+# Check container resource usage
+docker stats
+
+# View application logs for specific time range
+docker-compose logs --since 2h app
+
+# Restart specific service without affecting others
+docker-compose restart app
+```
+
+The system generates substantial logs over time, so implementing log rotation prevents disk exhaustion. Docker includes log rotation capabilities that you configure in the daemon configuration file.
+
+```json
+// /etc/docker/daemon.json
+// Docker daemon configuration for log rotation
+
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5"
+  }
+}
+```
+
+This configuration limits each container's logs to five files of one hundred megabytes each, automatically rotating when files reach the size limit. After changing this configuration, restart the Docker daemon with `sudo systemctl restart docker`.
+
+---
+
+## Conclusion
+
+You now have a complete implementation specification for your Telegram face recognition archival system. The five-part document covers every aspect from database design through processing pipeline implementation to deployment procedures. Each component has been explained with both the conceptual reasoning behind design decisions and the practical implementation details needed to build working code.
+
+The system architecture balances sophistication with maintainability. It uses proven technologies like PostgreSQL and InsightFace while avoiding unnecessary complexity that would make the codebase difficult to understand and modify. The containerized deployment ensures consistent operation across different environments, while the comprehensive configuration system allows tuning for your specific requirements.
+
+The documentation you have received serves multiple purposes. For immediate implementation, it provides concrete code examples and detailed specifications that an AI coding agent or human developer can transform into a working system. For long-term maintenance, it explains the reasoning behind architectural decisions so that future modifications can be made coherently. For troubleshooting, it describes how components interact and where to look when things go wrong.
+
+As you proceed with implementation, remember that building a complex system is an iterative process. Start with core functionality, verify it works correctly, then add additional features incrementally. Test each component thoroughly before integrating it with others. Monitor the system closely during initial deployment to identify and resolve issues before they affect large amounts of data. This measured approach produces more reliable results than attempting to implement everything simultaneously.

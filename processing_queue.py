@@ -1,0 +1,525 @@
+"""
+Processing Queue - Coordinates face processing pipeline.
+
+Orchestrates the complete workflow:
+Download → Extract Frames → Detect Faces → Match Identities → Upload
+
+Integrates all Phase 1-3 components.
+Includes queue backpressure for adaptive scan rate control.
+"""
+import logging
+import asyncio
+import io
+from typing import Dict, Any, Optional, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime, timezone
+import os
+from database import get_db_connection
+
+logger = logging.getLogger(__name__)
+
+
+class TaskType(Enum):
+    """Types of processing tasks."""
+    MEDIA = 'media'
+    PROFILE_PHOTO = 'profile_photo'
+
+
+class BackpressureState(Enum):
+    """Queue backpressure states."""
+    NORMAL = 'normal'      # Queue size < low watermark
+    WARNING = 'warning'    # Queue size between watermarks
+    CRITICAL = 'critical'  # Queue size > high watermark
+
+
+@dataclass
+class ProcessingTask:
+    """A task to be processed by the queue."""
+    task_type: TaskType
+    chat_id: int = 0
+    message_id: int = 0
+    user_id: int = 0
+    content: io.BytesIO = None
+    media_type: str = 'photo'  # 'photo', 'video', 'video_note'
+    file_unique_id: str = None  # For deduplication tracking
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ProcessingQueue:
+    """
+    Coordinates the face processing pipeline with a worker pool.
+    
+    Integrates:
+    - Phase 1: Database (storing embeddings, topics)
+    - Phase 2: Telegram (topic manager, media uploader, scanner)
+    - Phase 3: Face processing (detection, matching, video extraction)
+    
+    Features queue backpressure to prevent memory overload and
+    provide signals for adaptive scan rate control.
+    """
+    
+    def __init__(
+        self,
+        face_processor=None,
+        video_extractor=None,
+        identity_matcher=None,
+        media_uploader=None,
+        topic_manager=None,
+        num_workers: int = 3,
+        high_watermark: int = 100,
+        low_watermark: int = 20
+    ):
+        """
+        Args:
+            face_processor: FaceProcessor instance
+            video_extractor: VideoFrameExtractor instance
+            identity_matcher: IdentityMatcher instance
+            media_uploader: MediaUploader instance
+            topic_manager: TopicManager instance
+            num_workers: Number of concurrent workers
+            high_watermark: Queue size above which to signal slowdown
+            low_watermark: Queue size below which to resume normal speed
+        """
+        self.face_processor = face_processor
+        self.video_extractor = video_extractor
+        self.identity_matcher = identity_matcher
+        self.media_uploader = media_uploader
+        self.topic_manager = topic_manager
+        
+        self.num_workers = num_workers
+        self._workers = []
+        self._running = False
+        
+        # Redis Connection
+        from config import settings
+        import redis
+        self.redis_client = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=False  # Keep as bytes for binary content
+        )
+        self.queue_key = "processing_queue:tasks"
+        
+        # Backpressure configuration
+        self.high_watermark = high_watermark
+        self.low_watermark = low_watermark
+        self._backpressure_state = BackpressureState.NORMAL
+        self._backpressure_callbacks: list = []
+        
+        # Statistics
+        self.stats = {
+            'processed': 0,
+            'faces_found': 0,
+            'new_identities': 0,
+            'errors': 0
+        }
+        
+        try:
+            self.redis_client.ping()
+            logger.info(f"ProcessingQueue initialized with {num_workers} workers [Redis Connected]")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+            raise
+
+    async def start(self):
+        """Starts the worker pool."""
+        self._running = True
+        
+        for i in range(self.num_workers):
+            worker = asyncio.create_task(self._worker(i))
+            self._workers.append(worker)
+        
+        # Start heartbeat monitor
+        self._heartbeat_monitor_task = asyncio.create_task(self._monitor_heartbeats())
+        
+        logger.info(f"Started {self.num_workers} processing workers")
+    
+    async def stop(self):
+        """Stops the worker pool gracefully."""
+        self._running = False
+        
+        # Cancel all workers
+        for worker in self._workers:
+            worker.cancel()
+        
+        if hasattr(self, '_heartbeat_monitor_task'):
+            self._heartbeat_monitor_task.cancel()
+        
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers = []
+        
+        logger.info("Processing workers stopped")
+    
+    async def enqueue_media(
+        self,
+        chat_id: int,
+        message_id: int,
+        content: io.BytesIO,
+        media_type: str = 'photo',
+        file_unique_id: str = None
+    ):
+        """Enqueues media for face processing."""
+        import json
+        import base64
+        
+        content.seek(0)
+        content_b64 = base64.b64encode(content.read()).decode('ascii')
+        
+        task_data = {
+            'task_type': TaskType.MEDIA.value,
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'content_b64': content_b64,
+            'media_type': media_type,
+            'file_unique_id': file_unique_id
+        }
+        
+        # Push to Redis list (Right Push)
+        # Run in executor to avoid blocking asyncio loop with sync Redis call
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, 
+            self.redis_client.rpush, 
+            self.queue_key, 
+            json.dumps(task_data)
+        )
+        
+        self._check_backpressure()
+        logger.debug(f"Enqueued {media_type} from chat {chat_id}, msg {message_id}")
+    
+    async def enqueue_profile_photo(
+        self,
+        user_id: int,
+        content: io.BytesIO
+    ):
+        """Enqueues a profile photo for face processing."""
+        import json
+        import base64
+        
+        content.seek(0)
+        content_b64 = base64.b64encode(content.read()).decode('ascii')
+        
+        task_data = {
+            'task_type': TaskType.PROFILE_PHOTO.value,
+            'user_id': user_id,
+            'content_b64': content_b64,
+            'media_type': 'photo'
+        }
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, 
+            self.redis_client.rpush, 
+            self.queue_key, 
+            json.dumps(task_data)
+        )
+        
+        self._check_backpressure()
+        logger.debug(f"Enqueued profile photo for user {user_id}")
+    
+    def _check_backpressure(self):
+        """Checks queue size and updates backpressure state."""
+        queue_size = self.redis_client.llen(self.queue_key)
+        old_state = self._backpressure_state
+        
+        if queue_size >= self.high_watermark:
+            self._backpressure_state = BackpressureState.CRITICAL
+        elif queue_size >= self.low_watermark:
+            self._backpressure_state = BackpressureState.WARNING
+        else:
+            self._backpressure_state = BackpressureState.NORMAL
+        
+        # Notify callbacks if state changed
+        if old_state != self._backpressure_state:
+            logger.info(f"Backpressure state: {old_state.value} → {self._backpressure_state.value} (queue: {queue_size})")
+            self._notify_backpressure_change()
+            
+    def _notify_backpressure_change(self):
+        """Notifies registered callbacks of backpressure state change."""
+        for callback in self._backpressure_callbacks:
+            try:
+                callback(self._backpressure_state)
+            except Exception as e:
+                logger.error(f"Backpressure callback error: {e}")
+    
+    def register_backpressure_callback(self, callback: Callable):
+        """Registers a callback to be notified of backpressure state changes."""
+        self._backpressure_callbacks.append(callback)
+    
+    def get_backpressure_state(self) -> BackpressureState:
+        """Returns current backpressure state."""
+        return self._backpressure_state
+    
+    def should_slow_down(self) -> bool:
+        """Returns True if scanners should reduce their rate."""
+        return self._backpressure_state != BackpressureState.NORMAL
+    
+    def should_pause(self) -> bool:
+        """Returns True if scanners should pause completely."""
+        return self._backpressure_state == BackpressureState.CRITICAL
+    
+    async def _worker(self, worker_id: int):
+        """Worker coroutine that processes tasks from the Redis queue."""
+        logger.info(f"Worker {worker_id} started")
+        import json
+        import base64
+        
+        loop = asyncio.get_event_loop()
+        
+        while self._running:
+            try:
+                # Update heartbeat
+                await self._update_heartbeat(worker_id)
+                
+                # Fetch task from Redis (Left Pop with blocking)
+                # We use blpop with a timeout to allow checking _running flag
+                # Run in executor because redis-py is sync
+                result = await loop.run_in_executor(
+                    None,
+                    self.redis_client.blpop,
+                    self.queue_key,
+                    1  # 1 second timeout
+                )
+                
+                if not result:
+                    continue
+                    
+                # result is tuple (key, value)
+                _, task_json = result
+                
+                task_data = json.loads(task_json)
+                
+                # Reconstruct ProcessingTask
+                content_bytes = base64.b64decode(task_data['content_b64'])
+                content_io = io.BytesIO(content_bytes)
+                
+                task = ProcessingTask(
+                    task_type=TaskType(task_data['task_type']),
+                    chat_id=task_data.get('chat_id', 0),
+                    message_id=task_data.get('message_id', 0),
+                    user_id=task_data.get('user_id', 0),
+                    content=content_io,
+                    media_type=task_data.get('media_type', 'photo'),
+                    file_unique_id=task_data.get('file_unique_id')
+                )
+                
+                try:
+                    await self._process_task(task, worker_id)
+                    self.stats['processed'] += 1
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error processing task: {e}")
+                    self.stats['errors'] += 1
+                    # Optional: Re-queue failed task or move to dead-letter queue
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}")
+                await asyncio.sleep(1)
+        
+        logger.info(f"Worker {worker_id} stopped")
+
+    async def _update_heartbeat(self, worker_id: int):
+        """Updates the heartbeat timestamp for a worker in Redis."""
+        try:
+            timestamp = int(datetime.now(timezone.utc).timestamp())
+            key = f"worker_heartbeat:{worker_id}"
+            # Set with 5 minute TTL (if worker dies hard, key expires)
+            self.redis_client.setex(key, 300, timestamp)
+        except Exception as e:
+            logger.warning(f"Failed to update heartbeat for worker {worker_id}: {e}")
+
+    async def _monitor_heartbeats(self):
+        """Monitors worker heartbeats and alerts on stalls."""
+        from bot_client import get_bot_client
+        from config import settings
+        
+        while self._running:
+            await asyncio.sleep(60)  # Check every minute
+            
+            try:
+                now = int(datetime.now(timezone.utc).timestamp())
+                stuck_workers = []
+                
+                for i in range(self.num_workers):
+                    key = f"worker_heartbeat:{i}"
+                    last_beat = self.redis_client.get(key)
+                    
+                    if last_beat:
+                        last_beat = int(last_beat)
+                        if now - last_beat > 300:  # 5 minutes
+                            stuck_workers.append(i)
+                
+                if stuck_workers:
+                    msg = f"⚠️ **Worker Alert**: Workers {stuck_workers} haven't heartbeat in 5 mins!"
+                    logger.warning(msg)
+                    
+                    # Alert via Bot
+                    try:
+                        bot = await get_bot_client()
+                        await bot.send_message(settings.HUB_GROUP_ID, msg)
+                    except Exception as e:
+                        logger.error(f"Failed to send alert: {e}")
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Heartbeat monitor error: {e}")
+
+    async def _process_task(self, task: ProcessingTask, worker_id: int):
+        """Processes a single task through the complete pipeline."""
+        
+        if task.task_type == TaskType.PROFILE_PHOTO:
+            await self._process_profile_photo(task)
+        else:
+            await self._process_media(task)
+    
+    async def _process_media(self, task: ProcessingTask):
+        """
+        Complete media processing pipeline:
+        1. Extract frames (for video) or use image directly
+        2. Detect faces in each frame
+        3. Match each face to identity
+        4. Upload media to matched topics
+        """
+        logger.debug(f"Processing {task.media_type} from chat {task.chat_id}")
+        
+        # Step 1: Get frames
+        if task.media_type in ('video', 'video_note'):
+            is_round = task.media_type == 'video_note'
+            frames = await self.video_extractor.extract_frames(task.content, is_round)
+        else:
+            # Single image - wrap in list
+            frames = [task.content]
+        
+        if not frames:
+            logger.warning(f"No frames extracted from {task.media_type}")
+            return
+        
+        # Step 2 & 3: Detect faces and match identities
+        matched_topics = set()
+        
+        for frame_idx, frame in enumerate(frames):
+            faces = await self.face_processor.process_image(frame)
+            
+            for face in faces:
+                self.stats['faces_found'] += 1
+                
+                topic_id, is_new = await self.identity_matcher.find_or_create_identity(
+                    embedding=face['embedding'],
+                    quality_score=face['quality'],
+                    source_chat_id=task.chat_id,
+                    source_message_id=task.message_id,
+                    frame_index=frame_idx
+                )
+                
+                if topic_id:
+                    matched_topics.add(topic_id)
+                    if is_new:
+                        self.stats['new_identities'] += 1
+        
+        # Step 4: Upload media to all matched topics
+        if matched_topics and self.media_uploader:
+            task.content.seek(0)
+            
+            for topic_id in matched_topics:
+                await self.media_uploader.upload_to_topic(
+                    db_topic_id=topic_id,
+                    media_buffer=task.content,
+                    source_message_id=task.message_id,
+                    source_chat_id=task.chat_id
+                )
+                task.content.seek(0)  # Reset for next upload
+        
+        # Step 5: Mark file as processed for deduplication
+        if task.file_unique_id:
+            await self._mark_file_processed(
+                file_unique_id=task.file_unique_id,
+                media_type=task.media_type,
+                chat_id=task.chat_id,
+                message_id=task.message_id,
+                faces_found=len([t for t in matched_topics]),
+                topics_matched=list(matched_topics)
+            )
+        
+        logger.info(f"Processed {task.media_type}: {len(frames)} frames, matched to {len(matched_topics)} topics")
+    
+    async def _process_profile_photo(self, task: ProcessingTask):
+        """Processes a user's profile photo."""
+        logger.debug(f"Processing profile photo for user {task.user_id}")
+        
+        faces = await self.face_processor.process_image(task.content)
+        
+        for face in faces:
+            self.stats['faces_found'] += 1
+            
+            topic_id, is_new = await self.identity_matcher.find_or_create_identity(
+                embedding=face['embedding'],
+                quality_score=face['quality'],
+                source_chat_id=0,  # Profile photos don't have chat context
+                source_message_id=task.user_id,  # Use user_id as identifier
+                frame_index=0
+            )
+            
+            if is_new:
+                self.stats['new_identities'] += 1
+                
+                # Optionally upload profile photo to the new topic
+                if self.media_uploader and topic_id:
+                    task.content.seek(0)
+                    await self.media_uploader.upload_to_topic(
+                        db_topic_id=topic_id,
+                        media_buffer=task.content,
+                        source_message_id=task.user_id,
+                        source_chat_id=0,
+                        caption=f"👤 Profile photo (User ID: {task.user_id})"
+                    )
+        
+        logger.debug(f"Profile photo processed: {len(faces)} faces found")
+    
+    async def _mark_file_processed(
+        self,
+        file_unique_id: str,
+        media_type: str,
+        chat_id: int,
+        message_id: int,
+        faces_found: int,
+        topics_matched: list
+    ):
+        """
+        Records that a media file has been processed.
+        Used for deduplication of forwarded/duplicate content.
+        """
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        INSERT INTO processed_media 
+                            (file_unique_id, media_type, first_seen_chat_id, 
+                             first_seen_message_id, faces_found, topics_matched)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (file_unique_id) DO NOTHING
+                    """, (
+                        file_unique_id,
+                        media_type,
+                        chat_id,
+                        message_id,
+                        faces_found,
+                        topics_matched if topics_matched else None
+                    ))
+        except Exception as e:
+            logger.warning(f"Failed to mark file as processed: {e}")
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Returns processing statistics."""
+        return self.stats.copy()
+    
+    def get_queue_size(self) -> int:
+        """Returns current queue size."""
+        try:
+            return self.redis_client.llen(self.queue_key)
+        except Exception:
+            return 0
