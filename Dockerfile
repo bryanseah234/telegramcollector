@@ -4,7 +4,7 @@
 # ============================================
 # Stage 1: Builder
 # ============================================
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -21,14 +21,14 @@ RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.t
 # ============================================
 # Stage 2: Runtime
 # ============================================
-FROM python:3.11-slim as runtime
+FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

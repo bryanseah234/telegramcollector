@@ -94,7 +94,8 @@ face-archiver/
 ├── .gitignore
 ├── init-db.sql
 ├── README.md
-├── main.py
+├── worker.py              # Main application entry point
+├── config.py              # Centralized configuration
 ├── database.py
 ├── telegram_client.py
 ├── message_scanner.py
@@ -105,8 +106,6 @@ face-archiver/
 ├── video_extractor.py
 ├── identity_matcher.py
 ├── processing_queue.py
-├── update_checker.sh
-├── update_handler.py
 ├── login_bot.py
 ├── bot_client.py
 ├── dashboard.py
