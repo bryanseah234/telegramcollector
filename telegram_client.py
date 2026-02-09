@@ -103,45 +103,36 @@ class TelegramClientManager:
     async def _handle_invalid_session(self):
         """
         Handles cleanup for invalid sessions:
-        1. Updates DB status to 'invalid'
-        2. Deletes the local .session file
+        1. Updates DB status to 'paused' (not 'invalid') to preserve checkpoints
+        2. Does NOT delete session file - user can re-login via Login Bot
+        
+        This failsafe ensures:
+        - Scan progress (checkpoints) is preserved
+        - User can re-authenticate and resume where they left off
         """
         try:
-            # 1. Update Database
-            # We need to construct the likely path stored in DB to match it.
-            # self.session_name is just the name (e.g., 'account_123')
-            # The DB stores 'sessions/account_123.session' usually.
-            
             # Construct standard path
             session_file_path = os.path.join('sessions', f"{self.session_name}.session")
             
-            # Also try without extension just in case
-            
             async with get_db_connection() as conn:
                 async with conn.cursor() as cur:
+                    # Mark as 'paused' instead of 'invalid' to preserve checkpoints
                     await cur.execute("""
                         UPDATE telegram_accounts 
-                        SET status = 'invalid', last_error = 'Session revoked/invalid'
+                        SET status = 'paused', 
+                            last_error = 'Session logged out - use Login Bot to re-authenticate'
                         WHERE session_file_path = %s 
                            OR session_file_path = %s
                     """, (session_file_path, os.path.join('sessions', self.session_name)))
                     await conn.commit()
             
-            logger.info("Marked account as invalid in database.")
-
-            # 2. Delete Local File
-            full_path = f"{session_file_path}"
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info(f"Deleted invalid session file: {full_path}")
-            else:
-                # Telethon might append .session automatically if we passed a path without it
-                # check if self.client.session.filename is available? 
-                # For now, just try deleting with .session extension
-                pass
+            logger.warning(f"⚠️ Session {self.session_name} paused (logged out). Checkpoints preserved. Use Login Bot to re-authenticate.")
+            
+            # DO NOT delete session file - preserve for re-login
+            # The session file can be reused after user re-authenticates via Login Bot
 
         except Exception as e:
-            logger.error(f"Error during invalid session cleanup: {e}")
+            logger.error(f"Error during session pause handling: {e}")
     
     async def _health_monitor(self):
         """

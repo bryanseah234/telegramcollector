@@ -440,12 +440,19 @@ class ProcessingQueue:
     async def _process_media(self, task: ProcessingTask):
         """
         Complete media processing pipeline:
-        1. Extract frames (for video) or use image directly
-        2. Detect faces in each frame
-        3. Match each face to identity
-        4. Upload media to matched topics
+        1. Validate media (check for corruption)
+        2. Extract frames (for video) or use image directly
+        3. Detect faces in each frame
+        4. Match each face to identity
+        5. Upload media to matched topics
         """
         logger.debug(f"Processing {task.media_type} from chat {task.chat_id}")
+        
+        # Step 0: Validate media before processing
+        if not self._validate_media(task.content, task.media_type):
+            logger.warning(f"⚠️ Skipping invalid/corrupted {task.media_type} from chat {task.chat_id}")
+            self.stats['errors'] += 1
+            return
         
         # Step 1: Get frames
         if task.media_type in ('video', 'video_note'):
@@ -588,6 +595,59 @@ class ProcessingQueue:
                     ))
         except Exception as e:
             logger.warning(f"Failed to mark file as processed: {e}")
+    
+    def _validate_media(self, content: io.BytesIO, media_type: str) -> bool:
+        """
+        Validates that media content is not empty or corrupted.
+        
+        Args:
+            content: BytesIO buffer with media data
+            media_type: 'photo', 'video', or 'video_note'
+            
+        Returns:
+            True if valid, False if corrupted/empty
+        """
+        try:
+            content.seek(0)
+            data = content.read(1024)  # Read first 1KB for header check
+            content.seek(0)  # Reset for later use
+            
+            if not data or len(data) < 10:
+                logger.warning(f"Empty or too small {media_type} content ({len(data)} bytes)")
+                return False
+            
+            # Check for common image magic bytes
+            if media_type == 'photo':
+                # JPEG: FF D8 FF
+                # PNG: 89 50 4E 47
+                # GIF: 47 49 46 38
+                # WebP: 52 49 46 46 ... 57 45 42 50
+                jpeg_magic = data[:3] == b'\xff\xd8\xff'
+                png_magic = data[:4] == b'\x89PNG'
+                gif_magic = data[:4] == b'GIF8'
+                webp_magic = data[:4] == b'RIFF' and data[8:12] == b'WEBP'
+                
+                if not (jpeg_magic or png_magic or gif_magic or webp_magic):
+                    logger.warning(f"Invalid image format (magic bytes: {data[:4].hex()})")
+                    return False
+                    
+            elif media_type in ('video', 'video_note'):
+                # MP4/MOV: 00 00 00 XX 66 74 79 70 (ftyp at offset 4)
+                # WebM/MKV: 1A 45 DF A3
+                # AVI: 52 49 46 46 ... 41 56 49
+                mp4_ftyp = b'ftyp' in data[:32]
+                webm_magic = data[:4] == b'\x1aE\xdf\xa3'
+                avi_magic = data[:4] == b'RIFF' and data[8:11] == b'AVI'
+                
+                if not (mp4_ftyp or webm_magic or avi_magic):
+                    logger.warning(f"Invalid video format (magic bytes: {data[:8].hex()})")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Media validation error: {e}")
+            return False
     
     def get_stats(self) -> Dict[str, int]:
         """Returns processing statistics."""

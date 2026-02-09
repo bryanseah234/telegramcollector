@@ -34,15 +34,27 @@ class MessageScanner:
         Iterates through ALL dialogs (groups, channels, DMs) and adds them to the scan list.
         Categorizes by type: 'personal', 'group', 'channel'
         Feature: "scraping of all existing groups, channels and DMs"
+        
+        EXCLUDES: Hub Group (HUB_GROUP_ID) to prevent self-scraping
         """
+        from config import settings
+        hub_group_id = settings.HUB_GROUP_ID
+        
         logger.info("Starting discovery of all dialogs...")
         count = 0
+        skipped = 0
         stats = {'personal': 0, 'group': 0, 'channel': 0}
         
         try:
             async for dialog in self.client.iter_dialogs():
                 chat_id = dialog.id
                 chat_title = dialog.title or f"Chat_{chat_id}"
+                
+                # SKIP the hub group to prevent self-scraping
+                if chat_id == hub_group_id or chat_id == -hub_group_id or abs(chat_id) == abs(hub_group_id):
+                    logger.info(f"⏭️ Skipping Hub Group: {chat_title} (ID: {chat_id})")
+                    skipped += 1
+                    continue
                 
                 # Determine chat type for priority ordering
                 entity = dialog.entity

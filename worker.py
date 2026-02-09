@@ -375,6 +375,9 @@ class MainWorker:
         try:
             await self.initialize()
             
+            # Start health check scheduler as background task
+            health_task = asyncio.create_task(self._health_check_scheduler())
+            
             if mode in ('backfill', 'both'):
                 await self.run_backfill()
             
@@ -386,6 +389,162 @@ class MainWorker:
             raise
         finally:
             await self.shutdown()
+    
+    async def _health_check_scheduler(self):
+        """
+        Periodically performs comprehensive health checks and logs to Hub's general topic.
+        Runs every HEALTH_CHECK_INTERVAL seconds (default: 30 min).
+        """
+        interval = settings.HEALTH_CHECK_INTERVAL
+        logger.info(f"Health check scheduler started (interval: {interval}s)")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for the interval or shutdown
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    pass  # Time to run health check
+                
+                await self._run_health_checks()
+                
+            except Exception as e:
+                logger.error(f"Health check scheduler error: {e}")
+                await asyncio.sleep(60)  # Wait a bit before retrying
+    
+    async def _run_health_checks(self):
+        """Runs all health checks and posts report to Hub."""
+        from datetime import datetime
+        from database import get_db_connection, db_manager
+        from bot_client import bot_client_manager
+        import redis
+        
+        checks = {}
+        warnings = []
+        
+        # 1. Database Health
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT 1")
+            checks['Database'] = '✅ Connected'
+        except Exception as e:
+            checks['Database'] = f'❌ Error: {str(e)[:50]}'
+            warnings.append('Database')
+        
+        # 2. Redis Health
+        try:
+            redis_client = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD
+            )
+            redis_client.ping()
+            checks['Redis'] = '✅ Connected'
+        except Exception as e:
+            checks['Redis'] = f'❌ Error: {str(e)[:50]}'
+            warnings.append('Redis')
+        
+        # 3. Queue Health
+        if self.processing_queue:
+            try:
+                queue_size = self.processing_queue.get_queue_size()
+                queue_stats = self.processing_queue.get_stats()
+                bp_state = self.processing_queue.get_backpressure_state().value
+                
+                if queue_size >= settings.QUEUE_MAX_SIZE * 0.8:
+                    checks['Queue'] = f'⚠️ High load ({queue_size}/{settings.QUEUE_MAX_SIZE})'
+                    warnings.append('Queue (High Load)')
+                else:
+                    checks['Queue'] = f'✅ {queue_size} items ({bp_state})'
+                
+                checks['Processed'] = f'📊 {queue_stats.get("total_processed", 0)} total, {queue_stats.get("faces_found", 0)} faces'
+            except Exception as e:
+                checks['Queue'] = f'❌ Error: {str(e)[:50]}'
+                warnings.append('Queue')
+        else:
+            checks['Queue'] = '⏳ Not initialized'
+        
+        # 4. Telegram Accounts Health
+        active_accounts = 0
+        paused_accounts = 0
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT status, COUNT(*) FROM telegram_accounts GROUP BY status")
+                    rows = await cur.fetchall()
+                    status_counts = {row[0]: row[1] for row in rows}
+                    active_accounts = status_counts.get('active', 0)
+                    paused_accounts = status_counts.get('paused', 0)
+            
+            if paused_accounts > 0:
+                checks['Accounts'] = f'⚠️ {active_accounts} active, {paused_accounts} paused'
+                warnings.append('Paused Accounts')
+            else:
+                checks['Accounts'] = f'✅ {active_accounts} active'
+        except Exception as e:
+            checks['Accounts'] = f'❌ Error: {str(e)[:50]}'
+        
+        # 5. Scan Progress
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        SELECT 
+                            COUNT(*) as total,
+                            SUM(CASE WHEN is_complete = true THEN 1 ELSE 0 END) as complete
+                        FROM scan_checkpoints
+                    """)
+                    row = await cur.fetchone()
+                    total_chats = row[0] or 0
+                    complete_chats = row[1] or 0
+                    if total_chats > 0:
+                        progress = (complete_chats / total_chats) * 100
+                        checks['Scan Progress'] = f'📈 {complete_chats}/{total_chats} chats ({progress:.1f}%)'
+                    else:
+                        checks['Scan Progress'] = '⏳ No chats scanned yet'
+        except Exception as e:
+            checks['Scan Progress'] = f'❌ Error: {str(e)[:50]}'
+        
+        # 6. Topics/Identities
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT COUNT(*) FROM telegram_topics")
+                    topic_count = (await cur.fetchone())[0]
+                    await cur.execute("SELECT COUNT(*) FROM face_embeddings")
+                    face_count = (await cur.fetchone())[0]
+            checks['Identities'] = f'👥 {topic_count} topics, {face_count} embeddings'
+        except Exception as e:
+            checks['Identities'] = f'❌ Error: {str(e)[:50]}'
+        
+        # Build report
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        if warnings:
+            status_emoji = '⚠️'
+            status_text = f'Issues: {", ".join(warnings)}'
+        else:
+            status_emoji = '✅'
+            status_text = 'All systems operational'
+        
+        report = f"{status_emoji} **Health Check Report** - `{now}`\n\n"
+        report += f"**Status:** {status_text}\n\n"
+        
+        for key, value in checks.items():
+            report += f"• **{key}:** {value}\n"
+        
+        # Send to Hub's general topic (reply_to=None means general thread)
+        try:
+            client = bot_client_manager.client
+            hub_id = settings.HUB_GROUP_ID
+            if client and hub_id:
+                await client.send_message(hub_id, report)
+                logger.info(f"Health check report sent to Hub Group")
+        except Exception as e:
+            logger.error(f"Failed to send health check report: {e}")
     
     async def shutdown(self):
         """Gracefully shuts down all components."""
