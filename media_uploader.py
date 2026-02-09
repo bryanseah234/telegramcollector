@@ -76,6 +76,27 @@ class MediaUploader:
         Returns:
             The message_id of the uploaded media, or 0 on failure
         """
+        # 0. Validate input buffer
+        if not media_buffer:
+            logger.error(f"❌ Empty media buffer provided for msg {source_message_id}")
+            return 0
+            
+        try:
+            current_pos = media_buffer.tell()
+            media_buffer.seek(0, os.SEEK_END)
+            size = media_buffer.tell()
+            media_buffer.seek(current_pos)
+            
+            if size == 0:
+                logger.error(f"❌ Zero-byte media buffer for msg {source_message_id}")
+                return 0
+                
+            if size > 50 * 1024 * 1024:  # 50MB safety limit (Telegram bot limit)
+                logger.warning(f"⚠️ Large media ({size/1024/1024:.2f}MB) for msg {source_message_id}. Upload might fail.")
+        except Exception as e:
+            logger.error(f"❌ Failed to validate media buffer: {e}")
+            return 0
+
         # Check for duplicate
         if await self._is_duplicate(source_message_id, source_chat_id, db_topic_id):
             logger.info(f"⏭️ Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id} to topic {db_topic_id}")

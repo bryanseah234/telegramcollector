@@ -411,6 +411,7 @@ class ProcessingQueue:
         logger.info(f"Worker {worker_id} started")
         
         loop = asyncio.get_event_loop()
+        consecutive_errors = 0
         
         while self._running:
             try:
@@ -537,8 +538,14 @@ class ProcessingQueue:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker loop error: {e}")
-                await asyncio.sleep(1)
+                consecutive_errors += 1
+                delay = min(30, 1.5 ** consecutive_errors)  # Exponential backoff up to 30s
+                logger.error(f"Worker {worker_id} loop error (consecutive={consecutive_errors}): {e}")
+                logger.info(f"Worker {worker_id} sleeping {delay:.1f}s for panic recovery...")
+                await asyncio.sleep(delay)
+            else:
+                # Reset error count on successful loop iteration (if we get here)
+                consecutive_errors = 0
         
         logger.info(f"Worker {worker_id} stopped")
 

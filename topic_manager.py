@@ -9,71 +9,12 @@ import logging
 import asyncio
 import os
 import random
+import uuid
 from database import get_db_connection
-try:
-    from telethon.tl.functions.channels import CreateForumTopicRequest, EditForumTopicRequest
-except ImportError:
-    # Fallback or mock for environments where telethon might be different version
-    pass
+from resilience import CircuitOpenError
 
-logger = logging.getLogger(__name__)
+# ... (omitted)
 
-# Forum topic icon colors (Telegram palette)
-TOPIC_ICON_COLORS = [
-    0x6FB9F0,  # Blue
-    0xFFD67E,  # Yellow
-    0xCB86DB,  # Purple
-    0x8EEE98,  # Green
-    0xFF93B2,  # Pink
-    0xFB6F5F,  # Red
-]
-
-
-class TopicManager:
-    """
-    Manages Telegram Forum Topics for identity organization.
-    
-    Uses the bot client for all Telegram operations (creating/renaming topics).
-    This ensures the bot is the one managing the hub group, not user accounts.
-    """
-    
-    def __init__(self, client=None):
-        """
-        Initialize Topic Manager.
-        
-        Args:
-            client: Optional client for backwards compatibility.
-                   If None, uses the bot_client singleton.
-        """
-        self._client = client
-        self.hub_group_id = int(os.getenv('HUB_GROUP_ID', 0))
-        self._label_counter = None
-        
-        if not self.hub_group_id:
-            raise ValueError("HUB_GROUP_ID environment variable is required")
-        
-        # Cache for topic lookups to reduce DB hits
-        # Map: identity_id -> db_topic_id
-        self.topic_cache = {}
-    
-    async def _get_client(self):
-        """Gets the Telegram client - prefers bot client."""
-        if self._client is not None:
-            return self._client
-        
-        # Use bot client singleton
-        from bot_client import get_bot_client
-        return await get_bot_client()
-    
-    async def _get_next_label_number(self) -> int:
-        """DEPRECATED: Use DB auto-increment instead."""
-        # This method is kept for backwards compatibility but should not be used
-        async with get_db_connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM telegram_topics")
-                result = await cur.fetchone()
-                return result[0] if result else 1
-    
     async def create_topic(self, label: str = None) -> dict:
         """
         Creates a new forum topic in the hub group.
@@ -92,7 +33,6 @@ class TopicManager:
         icon_color = random.choice(TOPIC_ICON_COLORS)
         
         # Generate a temporary unique label to avoid Telegram duplicate title issues
-        import uuid
         temp_label = f"Person_{uuid.uuid4().hex[:8]}"
         
         from telethon.errors import FloodWaitError
@@ -103,7 +43,6 @@ class TopicManager:
                 # 1. First, reserve a DB ID to know the "Person X" number in advance
                 # Use a random negative number to avoid collision on the unique constraint for topic_id
                 # (Postgres constraint is on topic_id, which must be unique)
-                import uuid
                 temp_topic_id_reservation = -1 * random.randint(1, 2**31 - 1)
                 temp_label_reservation = "Reserved_Topic" 
                 
@@ -169,6 +108,11 @@ class TopicManager:
                 logger.warning(f"⏳ FloodWait creating topic. Waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
                 await asyncio.sleep(wait_time)
                 # Continue to next attempt
+            
+            except CircuitOpenError as e:
+                wait_time = 10 * (attempt + 1)
+                logger.warning(f"🔌 Database Circuit Open. Waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(wait_time)
                 
             except Exception as e:
                 logger.error(f"Failed to create topic: {e}")
@@ -176,7 +120,7 @@ class TopicManager:
                 # This is a minor junk data issue, acceptable trade-off for speed
                 raise
         
-        raise RuntimeError(f"Failed to create topic after {max_retries} FloodWait retries")
+        raise RuntimeError(f"Failed to create topic after {max_retries} retries")
     
     async def rename_topic(self, db_topic_id: int, new_label: str) -> bool:
         """
@@ -231,6 +175,10 @@ class TopicManager:
             
             logger.info(f"Renamed topic {db_topic_id} to '{new_label}'")
             return True
+            
+        except CircuitOpenError:
+            logger.warning(f"🔌 Database Circuit Open. Skipping rename of topic {db_topic_id}.")
+            return False
             
         except Exception as e:
             logger.error(f"Failed to rename topic {db_topic_id}: {e}")
