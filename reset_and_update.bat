@@ -1,19 +1,25 @@
 @echo off
 echo ========================================================
-echo SYSTEM WIPE AND RESTART
-echo WARNING: This will delete the DATABASE and REDIS data!
-echo Session files in ./sessions will be PRESERVED.
+echo SYSTEM RESET AND UPDATE
+echo WARNING: This will:
+echo 1. Delete DATABASE and REDIS data (Sessions preserved)
+echo 2. Discard ALL local code changes (Git Reset)
 echo ========================================================
 echo.
 echo 1. Stopping containers and removing volumes...
 docker-compose down -v
 
 echo.
-echo 2. Rebuilding and starting the system...
+echo 2. Force pulling latest code...
+git fetch origin
+git reset --hard origin/main
+
+echo.
+echo 3. Rebuilding and starting the system...
 docker-compose up -d --build
 
 echo.
 echo ========================================================
-echo Done! System has been reset.
+echo Done! System has been updated and reset.
 echo ========================================================
 pause
