@@ -31,6 +31,10 @@ class DatabaseManager:
             self._health_task = asyncio.create_task(self._pool_health_monitor())
             # Initialize circuit breaker
             self._circuit_breaker = get_circuit_breaker('database')
+            # FORCE RESET: Ensure we start with a closed circuit on new initialization
+            # This prevents "Death Spiral" where a restart inherits an OPEN state
+            if self._circuit_breaker:
+                self._circuit_breaker.reset()
     
     async def _initialize_pool(self):
         """Creates an async connection pool."""
