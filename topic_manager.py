@@ -101,9 +101,14 @@ class TopicManager:
         for attempt in range(max_retries):
             try:
                 # 1. First, reserve a DB ID to know the "Person X" number in advance
-                # Pass 0 as temp topic_id, we'll update it after creation
+                # Use a random negative number to avoid collision on the unique constraint for topic_id
+                # (Postgres constraint is on topic_id, which must be unique)
+                import uuid
+                temp_topic_id_reservation = -1 * random.randint(1, 2**31 - 1)
                 temp_label_reservation = "Reserved_Topic" 
-                db_id = await self._save_topic_to_db(0, temp_label_reservation)
+                
+                # Verify we don't accidentally hit an existing one (unlikely but possible with random)
+                db_id = await self._save_topic_to_db(temp_topic_id_reservation, temp_label_reservation)
                 
                 # 2. Determine final label
                 final_label = label if label else f"Person {db_id}"
