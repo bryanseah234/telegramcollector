@@ -189,11 +189,22 @@ class FaceProcessor:
             
             for face in faces:
                 # Quality filtering
-                dynamic_quality = get_dynamic_setting("MIN_QUALITY_THRESHOLD", self.min_quality)
+                # Default raised to 0.65 to filter out scenery/objects
+                dynamic_quality = get_dynamic_setting("MIN_QUALITY_THRESHOLD", 0.65)
                 
                 quality = float(face.det_score)
                 if quality < dynamic_quality:
                     logger.debug(f"Skipping low-quality face: {quality:.3f} < {dynamic_quality}")
+                    continue
+                
+                # Minimum size filtering (40x40 pixels)
+                bbox = face.bbox
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                min_size = 40
+                
+                if width < min_size or height < min_size:
+                    logger.debug(f"Skipping tiny face: {width:.1f}x{height:.1f} < {min_size}x{min_size}")
                     continue
                 
                 face_dict = {

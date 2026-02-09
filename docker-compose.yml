@@ -44,7 +44,10 @@ services:
       - "6380:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --save 60 1 --stop-writes-on-bgsave-error no --appendonly yes --loglevel warning
+    # Use AOF (Append Only File) for durability and faster startup
+    # key-value: 'appendonly yes'
+    # Disable RDB snapshots to avoid "LOADING" delays on large datasets during start
+    command: redis-server --appendonly yes --save "" --loglevel warning
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

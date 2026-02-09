@@ -117,11 +117,33 @@ class ProcessingQueue:
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
                 password=settings.REDIS_PASSWORD,
-                decode_responses=False  # Keep as bytes for binary content
+                decode_responses=False,
+                socket_timeout=5,     # Add timeout
+                socket_connect_timeout=5
             )
-            self.redis_client.ping()
-            self.redis_available = True
-            logger.info(f"ProcessingQueue initialized with {num_workers} workers [Redis Connected]")
+            
+            # Busy-wait for Redis to be ready (handle LOADING state)
+            max_retries = 30  # Wait up to 60s (2s interval)
+            for i in range(max_retries):
+                try:
+                    self.redis_client.ping()
+                    self.redis_available = True
+                    logger.info(f"ProcessingQueue initialized with {num_workers} workers [Redis Connected]")
+                    break
+                except redis.exceptions.BusyLoadingError:
+                    logger.warning(f"Redis is loading dataset... waiting 2s ({i+1}/{max_retries})")
+                    time.sleep(2)
+                except Exception as e:
+                    # If it's a connection error, it might not be up yet
+                    if "loading" in str(e).lower():
+                         logger.warning(f"Redis loading (generic error)... waiting 2s ({i+1}/{max_retries})")
+                         time.sleep(2)
+                    else:
+                        raise e
+            
+            if not self.redis_available:
+                raise Exception("Redis failed to become ready after 60s")
+                
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}. Using in-memory fallback.")
             self.redis_client = None
@@ -524,16 +546,18 @@ class ProcessingQueue:
                         self.record_processing_time(task.chat_id, duration)
                     
                     self.stats['processed'] += 1
-                except asyncio.TimeoutError:
-                    from observability import record_error
-                    record_error("TimeoutError")
-                    logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s")
-                    self.stats['errors'] += 1
-                    await self._move_to_dead_letter(task_data, "timeout")
-                except Exception as e:
-                    logger.error(f"Worker {worker_id} error processing task: {e}")
-                    self.stats['errors'] += 1
-                    await self._move_to_dead_letter(task_data, str(e))
+                    except asyncio.TimeoutError:
+                        from observability import record_error
+                        record_error("TimeoutError")
+                        logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s (Chat {task.chat_id})")
+                        self.stats['errors'] += 1
+                        # Include timeout specific metadata
+                        task_data['_failure_reason'] = "timeout"
+                        await self._move_to_dead_letter(task_data, "Task execution timed out")
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id} error processing task: {e} (Chat {task.chat_id})")
+                        self.stats['errors'] += 1
+                        await self._move_to_dead_letter(task_data, str(e))
                     
             except asyncio.CancelledError:
                 break
@@ -598,13 +622,31 @@ class ProcessingQueue:
 
     async def _update_heartbeat(self, worker_id: int):
         """Updates the heartbeat timestamp for a worker in Redis."""
-        try:
-            timestamp = int(datetime.now(timezone.utc).timestamp())
-            key = f"worker_heartbeat:{worker_id}"
-            # Set with 5 minute TTL (if worker dies hard, key expires)
-            self.redis_client.setex(key, 300, timestamp)
-        except Exception as e:
-            logger.warning(f"Failed to update heartbeat for worker {worker_id}: {e}")
+        # Add retry logic for temporary connection issues
+        for attempt in range(3):
+            try:
+                # If Redis is unavailable, skip heartbeat (don't crash worker)
+                if not self.redis_available and not self._try_reconnect_redis():
+                    return
+                
+                timestamp = int(datetime.now(timezone.utc).timestamp())
+                key = f"worker_heartbeat:{worker_id}"
+                
+                # Run in executor to avoid blocking if Redis is slow
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self.redis_client.setex,
+                    key, 
+                    300, 
+                    timestamp
+                )
+                return  # Success
+            except Exception as e:
+                if attempt == 2:  # Log only on final failure
+                    logger.warning(f"Failed to update heartbeat for worker {worker_id}: {e}")
+                else:
+                    await asyncio.sleep(1)  # Brief wait before retry
     
     def _check_worker_memory(self) -> bool:
         """
