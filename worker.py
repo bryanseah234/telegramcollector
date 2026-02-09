@@ -443,6 +443,7 @@ class MainWorker:
         
         checks = {}
         warnings = []
+        redis_client = None  # Initialize to None
         
         # 1. Database Health
         try:
@@ -460,13 +461,15 @@ class MainWorker:
                 host=settings.REDIS_HOST,
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
-                password=settings.REDIS_PASSWORD
+                password=settings.REDIS_PASSWORD,
+                socket_timeout=5  # Add timeout
             )
             redis_client.ping()
             checks['Redis'] = '✅ Connected'
         except Exception as e:
             checks['Redis'] = f'❌ Error: {str(e)[:50]}'
             warnings.append('Redis')
+            redis_client = None # Ensure it is None if failed
         
         # 3. Queue Health
         if self.processing_queue:
@@ -543,14 +546,17 @@ class MainWorker:
         
         # 7. Dead Letter Queue (failed tasks)
         try:
-            dlq_size = self.redis_client.llen(self.processing_queue.dead_letter_key)
-            if dlq_size > 100:
-                checks['Dead Letter Queue'] = f'⚠️ {dlq_size} failed tasks'
-                warnings.append('DLQ High')
-            elif dlq_size > 0:
-                checks['Dead Letter Queue'] = f'📋 {dlq_size} failed tasks'
+            if redis_client and self.processing_queue:
+                dlq_size = redis_client.llen(self.processing_queue.dead_letter_key)
+                if dlq_size > 100:
+                    checks['Dead Letter Queue'] = f'⚠️ {dlq_size} failed tasks'
+                    warnings.append('DLQ High')
+                elif dlq_size > 0:
+                    checks['Dead Letter Queue'] = f'📋 {dlq_size} failed tasks'
+                else:
+                    checks['Dead Letter Queue'] = '✅ Empty'
             else:
-                checks['Dead Letter Queue'] = '✅ Empty'
+                 checks['Dead Letter Queue'] = '⚠️ Redis/Queue unavailable'
         except Exception as e:
             checks['Dead Letter Queue'] = f'❌ Error: {str(e)[:50]}'
         
