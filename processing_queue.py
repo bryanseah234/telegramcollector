@@ -855,6 +855,8 @@ class ProcessingQueue:
             logger.info(f"📤 Uploading to {len(matched_topics)} topic(s) for msg {task.message_id}")
             task.content.seek(0)
             
+            upload_failures = 0
+            
             for topic_id in matched_topics:
                 result = await self.media_uploader.upload_to_topic(
                     db_topic_id=topic_id,
@@ -864,8 +866,15 @@ class ProcessingQueue:
                     media_type=task.media_type
                 )
                 if result == 0:
-                    logger.warning(f"⚠️ Upload to topic {topic_id} returned 0 (failed or duplicate)")
+                    logger.warning(f"⚠️ Upload to topic {topic_id} failed!")
+                    upload_failures += 1
                 task.content.seek(0)  # Reset for next upload
+
+            # CRITICAL: If any upload failed, fail the task so it goes to DLQ/Retry.
+            # MediaUploader handles deduplication, so successful uploads won't be duplicated on retry.
+            if upload_failures > 0:
+                raise Exception(f"Upload failed for {upload_failures}/{len(matched_topics)} topics")
+                
         elif not matched_topics:
             logger.debug(f"No faces matched for {task.media_type} msg {task.message_id}")
         
