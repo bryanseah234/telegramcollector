@@ -546,18 +546,18 @@ class ProcessingQueue:
                         self.record_processing_time(task.chat_id, duration)
                     
                     self.stats['processed'] += 1
-                    except asyncio.TimeoutError:
-                        from observability import record_error
-                        record_error("TimeoutError")
-                        logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s (Chat {task.chat_id})")
-                        self.stats['errors'] += 1
-                        # Include timeout specific metadata
-                        task_data['_failure_reason'] = "timeout"
-                        await self._move_to_dead_letter(task_data, "Task execution timed out")
-                    except Exception as e:
-                        logger.error(f"Worker {worker_id} error processing task: {e} (Chat {task.chat_id})")
-                        self.stats['errors'] += 1
-                        await self._move_to_dead_letter(task_data, str(e))
+                except asyncio.TimeoutError:
+                    from observability import record_error
+                    record_error("TimeoutError")
+                    logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s (Chat {task.chat_id})")
+                    self.stats['errors'] += 1
+                    # Include timeout specific metadata
+                    task_data['_failure_reason'] = "timeout"
+                    await self._move_to_dead_letter(task_data, "Task execution timed out")
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error processing task: {e} (Chat {task.chat_id})")
+                    self.stats['errors'] += 1
+                    await self._move_to_dead_letter(task_data, str(e))
                     
             except asyncio.CancelledError:
                 break
