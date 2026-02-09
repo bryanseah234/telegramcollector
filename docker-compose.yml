@@ -56,9 +56,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 1G
         reservations:
-          memory: 64M
+          memory: 256M
     logging:
       driver: "json-file"
       options:
@@ -94,6 +94,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
+      - .:/app
       - ./sessions:/app/sessions
       - update_signal:/app/signals
     deploy:
