@@ -31,6 +31,54 @@ class MessageScanner:
         self.batch_size = 100  # Checkpoint every 100 messages
         self.stats = {}
 
+    async def scan_contacts(self, account_id: int):
+        """
+        Scrapes profile photos of all contacts.
+        Priority Step 1: Establish identities from contacts before scanning chats.
+        """
+        logger.info("Starting contact scan (Step 1/4)...")
+        count = 0
+        new_photos = 0
+        
+        try:
+            # metadata=True gets photos too
+            contacts = await self.client.get_contacts()
+            total_contacts = len(contacts)
+            logger.info(f"Found {total_contacts} contacts to scan")
+            
+            for user in contacts:
+                if isinstance(user, User) and user.photo:
+                    current_photo_id = getattr(user.photo, 'photo_id', 0)
+                    
+                    # Check if this specific photo_id has been processed
+                    if not await self._is_photo_processed(user.id, current_photo_id):
+                        logger.debug(f"Fetching profile photo for contact {user.id} ({user.first_name})")
+                        
+                        try:
+                            # Download max size
+                            photo_bytes = await self.client.download_profile_photo(user, file=bytes)
+                            
+                            if photo_bytes:
+                                await self.processing_queue.enqueue_profile_photo(
+                                    user_id=user.id,
+                                    content=io.BytesIO(photo_bytes)
+                                )
+                                await self._mark_user_processed(user.id, current_photo_id)
+                                new_photos += 1
+                        except Exception as e:
+                            logger.error(f"Failed to download photo for contact {user.id}: {e}")
+                            
+                    count += 1
+                    if count % 50 == 0:
+                        logger.info(f"Scanned {count}/{total_contacts} contacts...")
+                        
+            logger.info(f"Contact scan complete. Processed {count} contacts, {new_photos} new profile photos enqueued.")
+            await notify('scan', f"✅ Contact Scan Complete: {count} contacts checked, {new_photos} new photos.")
+            
+        except Exception as e:
+            logger.error(f"Error during contact scan: {e}")
+            await notify('error', f"Contact scan failed: {e}")
+
     async def discover_and_scan_all_chats(self, account_id: int):
         """
         Iterates through ALL dialogs (groups, channels, DMs) and adds them to the scan list.
@@ -376,6 +424,7 @@ class MessageScanner:
 class RealtimeScanner:
     """
     Monitors chats for new messages in real-time using Telethon event handlers.
+    Also handles new user joins and contact updates.
     """
     
     def __init__(self, client, processing_queue, media_manager):
@@ -384,7 +433,19 @@ class RealtimeScanner:
         self.media_manager = media_manager
         self.monitored_chats = set()
         self._handler_added = False
+        self._contact_monitor_task = None
     
+    async def stop(self):
+        """Stops the realtime scanner and background tasks."""
+        if self._contact_monitor_task:
+            self._contact_monitor_task.cancel()
+            try:
+                await self._contact_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._contact_monitor_task = None
+        logger.info("Realtime scanner stopped.")
+
     async def start_monitoring(self, chat_ids: list, account_id: int):
         """
         Begins real-time monitoring of specified chats.
@@ -394,13 +455,23 @@ class RealtimeScanner:
         self._account_id = account_id
         
         if not self._handler_added:
-            @self.client.on(events.NewMessage(chats=list(chat_ids)))
+            # 1. New Message Handler
+            @self.client.on(events.NewMessage(chats=list(chat_ids) if chat_ids else None))
             async def handle_new_message(event):
                 await self._process_new_message(event)
             
+            # 2. Chat Action Handler (User Joins)
+            @self.client.on(events.ChatAction(chats=list(chat_ids) if chat_ids else None))
+            async def handle_chat_action(event):
+                await self._process_chat_action(event)
+                
             self._handler_added = True
         
-        logger.info(f"Real-time monitoring started for {len(chat_ids)} chats")
+        # Start periodic contact monitor
+        if not self._contact_monitor_task:
+            self._contact_monitor_task = asyncio.create_task(self._periodic_contact_scan())
+            
+        logger.info(f"Real-time monitoring started for {len(self.monitored_chats)} chats")
     
     async def _process_new_message(self, event):
         """Handles incoming messages from monitored chats."""
@@ -432,6 +503,116 @@ class RealtimeScanner:
             await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error(f"Error processing realtime message: {e}")
+            
+    async def _process_chat_action(self, event):
+        """Handles user joins/adds to scan their profile photos immediately."""
+        try:
+            if event.user_joined or event.user_added:
+                users = await event.get_users()
+                chat_id = event.chat_id
+                logger.info(f"👥 Users joined/added to chat {chat_id}: {[u.id for u in users]}")
+                
+                for user in users:
+                    if isinstance(user, User) and user.photo:
+                        logger.info(f"  → Fetching profile photo for new member {user.id}")
+                        photo_bytes = await self.client.download_profile_photo(user, file=bytes)
+                        
+                        if photo_bytes:
+                            await self.processing_queue.enqueue_profile_photo(
+                                user_id=user.id,
+                                content=io.BytesIO(photo_bytes)
+                            )
+        except Exception as e:
+            logger.error(f"Error processing chat action: {e}")
+
+    async def _periodic_contact_scan(self):
+        """Periodically rescans contacts to pick up new ones."""
+        logger.info("🔄 Periodic contact monitor started (Interval: 60m)")
+        while True:
+            try:
+                # Wait 60 minutes
+                await asyncio.sleep(3600)
+                
+                logger.info("⏰ Running periodic contact scan...")
+                # We need an instance of MessageScanner to reuse scan_contacts?
+                # Or just re-implement simple logic here? 
+                # Re-implementing is cleaner to avoid circular deps or passing scanners around.
+                
+                contacts = await self.client.get_contacts()
+                count = 0
+                for user in contacts:
+                    if isinstance(user, User) and user.photo:
+                        # We don't have easy access to _is_photo_processed (it's in MessageScanner)
+                        # But we can just queue it - deduplication happens in ProcessingQueue/DB anyway!
+                        # Downloading everything might be heavy though.
+                        # Let's check DB properly.
+                        
+                        # Re-use MessageScanner logic?
+                        # It's better if RealtimeScanner takes a reference to MessageScanner?
+                        # OR we just import the DB check
+                        pass
+                        
+                # Actually, main.py has the scanner. 
+                # Maybe we shouldn't run this inside RealtimeScanner but in main.py loop?
+                # But user asked for "real time scraping ensure...".
+                # Let's keep it here but keep it simple.
+                
+                # Fetch all contacts, enqueue them.
+                # ProcessingQueue dedupes based on content? No, based on ID?
+                # MessageScanner had _is_photo_processed.
+                # Let's verify _is_photo_processed in MessageScanner is static or instance? 
+                # Instance. 
+                
+                # For now, let's just log. Implementing full scan here duplicates logic.
+                # BETTER: Call the MessageScanner's method if we can.
+                # But we don't have ref to MessageScanner.
+                
+                # ALTERNATIVE: Just blindly enqueue. The DB dedupe will prevent re-processing.
+                # BUT downloading 1000 photos every hour is bad for bandwidth.
+                
+                # I'll rely on the manual orchestrator loop in main.py for heavy lifting?
+                # No, user wants realtime.
+                
+                # I'll do a specialized "check new contacts" here.
+                # Actually, let's just access the DB function directly.
+                pass 
+                
+                # Implementation:
+                new_count = 0
+                for user in contacts:
+                    if user.photo and hasattr(user.photo, 'photo_id'):
+                        pid = user.photo.photo_id
+                        # Check DB
+                        if not await self._check_if_user_processed(user.id, pid):
+                            photo_bytes = await self.client.download_profile_photo(user, file=bytes)
+                            if photo_bytes:
+                                await self.processing_queue.enqueue_profile_photo(user.id, io.BytesIO(photo_bytes))
+                                await self._mark_user_processed(user.id, pid)
+                                new_count += 1
+                                
+                if new_count > 0:
+                    logger.info(f"✅ Periodic contact scan: Found {new_count} new profile photos")
+                    
+            except Exception as e:
+                logger.error(f"Periodic contact scan failed: {e}")
+
+    async def _check_if_user_processed(self, user_id: int, photo_id: int) -> bool:
+        """Duplicated simple check to avoid import cycles."""
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT photo_id FROM processed_users WHERE user_id = %s", (user_id,))
+                row = await cur.fetchone()
+                return row and row[0] == photo_id
+
+    async def _mark_user_processed(self, user_id: int, photo_id: int):
+        """Duplicated simple mark."""
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO processed_users (user_id, photo_id, last_scan) 
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET photo_id = EXCLUDED.photo_id, last_scan = NOW()
+                """, (user_id, photo_id))
     
     async def _update_realtime_checkpoint(self, chat_id: int, message_id: int):
         """Updates checkpoint for realtime-scanned message."""

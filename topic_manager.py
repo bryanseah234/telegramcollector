@@ -13,7 +13,55 @@ import uuid
 from database import get_db_connection
 from resilience import CircuitOpenError
 
-# ... (omitted)
+try:
+    from telethon.tl.functions.channels import CreateForumTopicRequest, EditForumTopicRequest
+except ImportError:
+    pass
+
+logger = logging.getLogger(__name__)
+
+# Forum topic icon colors (Telegram palette)
+TOPIC_ICON_COLORS = [
+    0x6FB9F0,  # Blue
+    0xFFD67E,  # Yellow
+    0xCB86DB,  # Purple
+    0x8EEE98,  # Green
+    0xFF93B2,  # Pink
+    0xFB6F5F,  # Red
+]
+
+
+class TopicManager:
+    """
+    Manages Telegram Forum Topics for identity organization.
+    
+    Uses the bot client for all Telegram operations (creating/renaming topics).
+    This ensures the bot is the one managing the hub group, not user accounts.
+    """
+    
+    def __init__(self, client=None):
+        """
+        Initialize Topic Manager.
+        
+        Args:
+            client: Optional client for backwards compatibility.
+                   If None, uses the bot_client singleton.
+        """
+        self._client = client
+        self.hub_group_id = int(os.getenv('HUB_GROUP_ID', 0))
+        
+        # Cache for topic lookups to reduce DB hits
+        # Map: identity_id -> db_topic_id
+        self.topic_cache = {}
+    
+    async def _get_client(self):
+        """Gets the Telegram client - prefers bot client."""
+        if self._client is not None:
+            return self._client
+        
+        # Use bot client singleton
+        from bot_client import get_bot_client
+        return await get_bot_client()
 
     async def create_topic(self, label: str = None) -> dict:
         """

@@ -714,6 +714,31 @@ class ProcessingQueue:
         else:
             await self._process_media(task)
     
+    def _validate_media(self, content: io.BytesIO, media_type: str) -> bool:
+        """Validates media content before processing."""
+        if not content:
+            return False
+            
+        try:
+            # Check size
+            current_pos = content.tell()
+            content.seek(0, os.SEEK_END)
+            size = content.tell()
+            content.seek(current_pos)
+            
+            if size == 0:
+                return False
+                
+            # Basic sanity check on size (e.g. max 50MB)
+            if size > 50 * 1024 * 1024:
+                logger.warning(f"Media too large ({size/1024/1024:.1f}MB)")
+                return False
+                
+            return True
+        except Exception as e:
+            logger.error(f"Media validation error: {e}")
+            return False
+
     async def _process_media(self, task: ProcessingTask):
         """
         Complete media processing pipeline:

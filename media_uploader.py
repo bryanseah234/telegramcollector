@@ -294,7 +294,8 @@ class MediaUploader:
                 media_buffer=item['buffer'],
                 source_message_id=item['message_id'],
                 source_chat_id=item['chat_id'],
-                caption=item.get('caption')
+                caption=item.get('caption'),
+                media_type=item.get('media_type', 'photo')
             )
             results.append(message_id)
             
