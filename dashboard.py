@@ -234,18 +234,18 @@ def get_identities(page: int = 1, per_page: int = 12, search: str = "", sort_by:
         
         # Order by
         order_map = {
-            'last_seen': 'last_seen DESC',
-            'first_seen': 'first_seen ASC',
+            'last_seen': 'updated_at DESC',
+            'first_seen': 'created_at ASC',
             'name': 'label ASC',
-            'faces': 'embedding_count DESC'
+            'faces': 'face_count DESC'
         }
-        order = order_map.get(sort_by, 'last_seen DESC')
+        order = order_map.get(sort_by, 'updated_at DESC')
         
         offset = (page - 1) * per_page
         
         query = f"""
-            SELECT id, topic_id, label, first_seen, last_seen, 
-                   embedding_count, message_count, exemplar_image_url
+            SELECT id, topic_id, label, created_at, updated_at, 
+                   face_count, message_count, exemplar_image_url
             FROM telegram_topics
             {where_clause}
             ORDER BY {order}
@@ -271,8 +271,8 @@ def get_identity_detail(identity_id: int):
         
         # Identity info
         cursor.execute("""
-            SELECT id, topic_id, label, first_seen, last_seen,
-                   embedding_count, message_count, exemplar_image_url
+            SELECT id, topic_id, label, created_at, updated_at,
+                   face_count, message_count, exemplar_image_url
             FROM telegram_topics
             WHERE id = %s
         """, (identity_id,))
@@ -616,7 +616,7 @@ def render_identity_detail():
                 # Update target counts
                 cursor.execute("""
                     UPDATE telegram_topics SET
-                        embedding_count = (SELECT COUNT(*) FROM face_embeddings WHERE topic_id = %s),
+                        face_count = (SELECT COUNT(*) FROM face_embeddings WHERE topic_id = %s),
                         message_count = (SELECT COUNT(*) FROM uploaded_media WHERE topic_id = %s)
                     WHERE id = %s
                 """, (target_id, target_id, target_id))
@@ -683,7 +683,7 @@ def render_face_search():
                             # Use pgvector for similarity search
                             cursor.execute("""
                                 SELECT 
-                                    t.id, t.label, t.embedding_count,
+                                    t.id, t.label, t.face_count,
                                     1 - (e.embedding <=> %s::vector) as similarity
                                 FROM face_embeddings e
                                 JOIN telegram_topics t ON e.topic_id = t.id

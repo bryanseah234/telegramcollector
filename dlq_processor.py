@@ -106,10 +106,16 @@ class DLQProcessor:
         logger.info("DLQ processor stopped")
     
     async def _process_loop(self):
-        """Main processing loop - runs every 5 minutes."""
+        """Main processing loop - runs every 60 seconds."""
+        # Initial check immediately on start
+        try:
+             await self._process_eligible_tasks()
+        except Exception:
+             pass
+
         while self._running:
             try:
-                await asyncio.sleep(300)  # Check every 5 minutes
+                await asyncio.sleep(60)  # Check every minute (was 300)
                 await self._process_eligible_tasks()
             except asyncio.CancelledError:
                 break
