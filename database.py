@@ -136,7 +136,12 @@ class DatabaseManager:
                 pass
         
         if self.pool:
-            await self.pool.close()
+            try:
+                await self.pool.close()
+            except Exception as e:
+                logger.error(f"Error closing DB pool: {e}")
+            finally:
+                self.pool = None
             logger.info("Database pool closed")
 
 # Global instance
