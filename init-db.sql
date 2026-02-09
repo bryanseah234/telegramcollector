@@ -101,13 +101,15 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_chat_type ON scan_checkpoints(chat_ty
 -- Prevents duplicate uploads during restart/recovery
 CREATE TABLE IF NOT EXISTS uploaded_media (
     id SERIAL PRIMARY KEY,
-    topic_id INTEGER REFERENCES telegram_topics(id) ON DELETE CASCADE,
-    source_message_id BIGINT NOT NULL,
     source_chat_id BIGINT NOT NULL,
-    hub_message_id BIGINT NOT NULL,            -- Message ID in the hub group
-    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(source_chat_id, source_message_id)  -- Prevent duplicate uploads
+    source_message_id INTEGER NOT NULL,
+    topic_id INTEGER references telegram_topics(id) ON DELETE CASCADE,
+    hub_message_id INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_chat_id, source_message_id, topic_id)
 );
+  -- Prevent duplicate uploads
+
 
 CREATE INDEX IF NOT EXISTS idx_uploaded_source ON uploaded_media(source_chat_id, source_message_id);
 CREATE INDEX IF NOT EXISTS idx_uploaded_topic ON uploaded_media(topic_id);

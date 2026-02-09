@@ -109,6 +109,8 @@ face-archiver/
 ├── login_bot.py
 ├── bot_client.py
 ├── dashboard.py
+├── reset_and_update.bat   # Helper for Windows updates
+├── reset_and_update.sh    # Helper for Linux updates
 └── tests/
     └── test_integration.py
 ```
@@ -250,9 +252,6 @@ async with client:
 ### Database Patterns
 
 ```python
-### Database Patterns
-
-```python
 # Always use async context manager
 async with get_db_connection() as conn:
     async with conn.cursor() as cur:
@@ -265,8 +264,6 @@ await cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
 # Convert lists to PostgreSQL format for pgvector
 embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 await cur.execute("INSERT INTO embeddings (vec) VALUES (%s::vector)", (embedding_str,))
-```
-
 ```
 
 ---
@@ -521,6 +518,7 @@ Before deploying to production:
 - Review and address accumulated errors
 - Check database size and performance
 - Verify backups are current
+- Run Updates: Use `reset_and_update.bat` (Windows) or `./reset_and_update.sh` (Linux) to pull latest code and reset database if needed.
 
 ### Monthly
 

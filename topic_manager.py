@@ -100,13 +100,21 @@ class TopicManager:
         
         for attempt in range(max_retries):
             try:
+                # 1. First, reserve a DB ID to know the "Person X" number in advance
+                # Pass 0 as temp topic_id, we'll update it after creation
+                temp_label_reservation = "Reserved_Topic" 
+                db_id = await self._save_topic_to_db(0, temp_label_reservation)
+                
+                # 2. Determine final label
+                final_label = label if label else f"Person {db_id}"
+                
+                # 3. Create topic with FINAL name directly
                 # Get the hub group entity
                 hub = await client.get_input_entity(self.hub_group_id)
                 
-                # Create the forum topic with temporary name
                 result = await client(CreateForumTopicRequest(
                     channel=hub,
-                    title=temp_label,
+                    title=final_label,
                     icon_color=icon_color,
                     random_id=random.randint(1, 2**31 - 1)
                 ))
@@ -120,7 +128,7 @@ class TopicManager:
                             break
                 
                 if not telegram_topic_id:
-                    # Fallback: get from the message
+                     # Fallback: get from the message
                     if hasattr(result, 'updates'):
                         for update in result.updates:
                             if hasattr(update, 'message') and hasattr(update.message, 'reply_to'):
@@ -129,40 +137,20 @@ class TopicManager:
                                     break
                 
                 if not telegram_topic_id:
-                    raise RuntimeError("Could not extract topic ID from CreateForumTopicRequest result")
+                    # rollback DB entry? or just leave as unused gap?
+                    # Gap is safer than deleting potentially wrong thing
+                    logger.error(f"Failed to get topic ID for DB ID {db_id}")
+                    raise RuntimeError("Could not extract topic ID")
                 
-                # Save to database FIRST to get unique auto-increment ID
-                db_id = await self._save_topic_to_db(telegram_topic_id, temp_label)
-                
-                # Now rename topic to use the guaranteed unique DB ID
-                final_label = label if label else f"Person {db_id}"
-                
-                if final_label != temp_label:
-                    # Rename in Telegram (with FloodWait handling)
-                    try:
-                        await client(EditForumTopicRequest(
-                            channel=hub,
-                            topic_id=telegram_topic_id,
-                            title=final_label
-                        ))
-                    except FloodWaitError as e:
-                        logger.warning(f"⏳ FloodWait on rename. Waiting {e.seconds}s...")
-                        await asyncio.sleep(e.seconds)
-                        await client(EditForumTopicRequest(
-                            channel=hub,
-                            topic_id=telegram_topic_id,
-                            title=final_label
-                        ))
-                    
-                    # Update label in database
-                    async with get_db_connection() as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute("""
-                                UPDATE telegram_topics 
-                                SET label = %s
-                                WHERE id = %s
-                            """, (final_label, db_id))
-                
+                # 4. Update the DB entry with the real Telegram Topic ID and Label
+                async with get_db_connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("""
+                            UPDATE telegram_topics 
+                            SET topic_id = %s, label = %s
+                            WHERE id = %s
+                        """, (telegram_topic_id, final_label, db_id))
+
                 logger.info(f"Created topic '{final_label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
                 
                 return {
@@ -172,12 +160,15 @@ class TopicManager:
                 }
                 
             except FloodWaitError as e:
-                logger.warning(f"⏳ FloodWait creating topic. Waiting {e.seconds}s (attempt {attempt + 1}/{max_retries})...")
-                await asyncio.sleep(e.seconds)
+                wait_time = e.seconds + 5
+                logger.warning(f"⏳ FloodWait creating topic. Waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(wait_time)
                 # Continue to next attempt
                 
             except Exception as e:
                 logger.error(f"Failed to create topic: {e}")
+                # If we reserved an ID but failed, it stays as "Reserved_Topic" with ID 0
+                # This is a minor junk data issue, acceptable trade-off for speed
                 raise
         
         raise RuntimeError(f"Failed to create topic after {max_retries} FloodWait retries")

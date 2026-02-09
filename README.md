@@ -185,6 +185,28 @@ docker-compose logs -f
 
 ---
 
+## 🔄 Maintenance & Updates
+
+### Updating the System
+
+To update the system with the latest code from GitHub and reset the database (if needed), use the provided helper scripts:
+
+**Windows:**
+
+```cmd
+reset_and_update.bat
+```
+
+**Linux/Mac:**
+
+```bash
+./reset_and_update.sh
+```
+
+**⚠️ WARNING:** These scripts will **WIPE the database** and restart all services. Use this when you want a fresh start with the latest code. Your session files (login) will be preserved.
+
+---
+
 ## 🔧 How It Works
 
 ### System Flow
@@ -280,6 +302,8 @@ telegramcollector/
 ├── face_processor.py   # InsightFace AI detection
 ├── identity_matcher.py # pgvector similarity search
 ├── dashboard.py        # Web interface
+├── reset_and_update.bat # Windows update script
+├── reset_and_update.sh  # Linux update script
 └── sessions/           # Saved login sessions
 ```
 

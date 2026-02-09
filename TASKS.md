@@ -8,7 +8,7 @@ This document breaks down the implementation into discrete, sequential tasks tha
 
 ## Phase 1: Foundation and Database Setup
 
-### Task 1.1: Database Schema Implementation ✅
+### Task 1.1: Database Schema Implementation
 
 **Priority:** CRITICAL
 **Estimated Effort:** 2 hours
@@ -41,7 +41,7 @@ SELECT * FROM pg_extension WHERE extname = 'vector';  -- Should show pgvector in
 
 ---
 
-### Task 1.2: Database Connection Pool Module ✅
+### Task 1.2: Database Connection Pool Module
 
 **Priority:** CRITICAL
 **Estimated Effort:** 1 hour
@@ -90,7 +90,7 @@ for conn in connections:
 
 ---
 
-### Task 1.3: Environment Configuration ✅
+### Task 1.3: Environment Configuration
 
 **Priority:** CRITICAL
 **Estimated Effort:** 30 minutes
@@ -133,7 +133,7 @@ grep "\.env$" .gitignore
 
 ## Phase 2: Telegram Integration
 
-### Task 2.1: Telegram Client Initialization ✅
+### Task 2.1: Telegram Client Initialization
 
 **Priority:** CRITICAL
 **Estimated Effort:** 2 hours
@@ -177,7 +177,7 @@ await client.disconnect()
 
 ---
 
-### Task 2.2: Message Scanner Implementation ✅
+### Task 2.2: Message Scanner Implementation
 
 **Priority:** CRITICAL
 **Estimated Effort:** 4 hours
@@ -224,7 +224,7 @@ with get_db_connection() as conn:
 
 ---
 
-### Task 2.3: Topic Manager Implementation ✅
+### Task 2.3: Topic Manager Implementation
 
 **Priority:** HIGH
 **Estimated Effort:** 3 hours
@@ -270,7 +270,7 @@ with get_db_connection() as conn:
 
 ---
 
-### Task 2.4: Media Upload Manager ✅
+### Task 2.4: Media Upload Manager
 
 **Priority:** HIGH
 **Estimated Effort:** 3 hours
@@ -325,7 +325,7 @@ with get_db_connection() as conn:
 
 ## Phase 3: Face Processing Pipeline
 
-### Task 3.1: Media Download Manager ✅
+### Task 3.1: Media Download Manager
 
 **Priority:** CRITICAL
 **Estimated Effort:** 2 hours
@@ -372,7 +372,7 @@ assert buffer is None  # Should reject oversized files
 
 ---
 
-### Task 3.2: Face Detection and Embedding Extraction ✅
+### Task 3.2: Face Detection and Embedding Extraction
 
 **Priority:** CRITICAL
 **Estimated Effort:** 3 hours
@@ -419,7 +419,7 @@ assert 0 <= faces[0]['quality'] <= 1
 
 ---
 
-### Task 3.3: Video Frame Extractor ✅
+### Task 3.3: Video Frame Extractor
 
 **Priority:** HIGH
 **Estimated Effort:** 4 hours
@@ -470,7 +470,7 @@ assert len(round_frames) >= len(frames)  # Higher frame rate
 
 ---
 
-### Task 3.4: Identity Matcher and Clustering ✅
+### Task 3.4: Identity Matcher and Clustering
 
 **Priority:** CRITICAL
 **Estimated Effort:** 4 hours
@@ -530,7 +530,7 @@ assert topic_id2 == topic_id1
 
 ---
 
-### Task 3.5: Processing Queue and Workflow ✅
+### Task 3.5: Processing Queue and Workflow
 
 **Priority:** CRITICAL
 **Estimated Effort:** 5 hours
@@ -595,7 +595,7 @@ await queue.stop()
 
 ## Phase 4: Dashboard Interface
 
-### Task 4.1: Main Dashboard View ✅
+### Task 4.1: Main Dashboard View
 
 **Priority:** HIGH
 **Estimated Effort:** 3 hours
@@ -642,7 +642,7 @@ streamlit run dashboard.py --server.port=8501
 
 ---
 
-### Task 4.2: Identity Gallery View ✅
+### Task 4.2: Identity Gallery View
 
 **Priority:** HIGH
 **Estimated Effort:** 4 hours
@@ -685,7 +685,7 @@ Implement the paginated identity gallery with search and filtering.
 
 ---
 
-### Task 4.3: Identity Detail and Manual Corrections ✅
+### Task 4.3: Identity Detail and Manual Corrections
 
 **Priority:** HIGH
 **Estimated Effort:** 5 hours
@@ -739,7 +739,7 @@ Implement detailed identity view with rename, merge, and split functionality.
 
 ---
 
-### Task 4.4: Reverse Image Search ✅
+### Task 4.4: Reverse Image Search
 
 **Priority:** MEDIUM
 **Estimated Effort:** 3 hours
@@ -957,16 +957,16 @@ docker-compose exec postgres psql -U postgres -d face_archiver -c \
 
 **Success Criteria:**
 
-- [x] Bot handles authentication flow
-- [x] Session file created and valid
-- [x] Database record created correctly
-- [x] 2FA passwords deleted immediately
-- [x] All messages auto-deleted after 2 minutes
-- [x] Clear error messages for failures
+- [ ] Bot handles authentication flow
+- [ ] Session file created and valid
+- [ ] Database record created correctly
+- [ ] 2FA passwords deleted immediately
+- [ ] All messages auto-deleted after 2 minutes
+- [ ] Clear error messages for failures
 
 ---
 
-### Task 5.4: Auto-Scan All Dialogs ✅
+### Task 5.4: Auto-Scan All Dialogs
 
 **Priority:** HIGH
 **Estimated Effort:** 1 hour
@@ -999,9 +999,9 @@ docker-compose logs -f app
 
 **Success Criteria:**
 
-- [x] All dialogs automatically discovered
-- [x] Progress tracking accurate
-- [x] No manual intervention required
+- [ ] All dialogs automatically discovered
+- [ ] Progress tracking accurate
+- [ ] No manual intervention required
 
 ---
 
@@ -1070,8 +1070,8 @@ Create comprehensive documentation for deployment and usage.
 **Files to Create:**
 
 - `README.md` - Main project documentation
-- `DEPLOYMENT.md` - Detailed deployment guide
-- `MAINTENANCE.md` - Operational procedures
+- `DEPLOYMENT.md` - Detailed deployment guide (Optional, can be part of README)
+- `INSTRUCTIONS.md` - Instructions for AI agents
 
 **Requirements:**
 
@@ -1101,6 +1101,43 @@ Create comprehensive documentation for deployment and usage.
 - [ ] Common issues covered in troubleshooting
 - [ ] Maintenance procedures clear
 - [ ] Examples provided for all operations
+
+---
+
+### Task 5.7: Maintenance Scripts
+
+**Priority:** HIGH
+**Estimated Effort:** 1 hour
+**Dependencies:** Task 5.1
+
+**Description:**
+Create scripts to simplify system updates and maintenance operations.
+
+**Files to Create:**
+
+- `reset_and_update.bat` - Windows update script
+- `reset_and_update.sh` - Linux update script
+
+**Requirements:**
+
+- Scripts should pull the latest code from git
+- Rebuild/restart Docker containers
+- Option to reset database (danger zone)
+- Preserve session files
+
+**Verification:**
+
+```bash
+# Test scripts (careful, this might reset DB)
+./reset_and_update.sh
+# Verify system comes back up
+```
+
+**Success Criteria:**
+
+- [ ] Scripts execute without errors
+- [ ] System updates successfully
+- [ ] Database reset option works
 
 ---
 
@@ -1174,20 +1211,20 @@ Validate system performance meets requirements.
 
 ## Task Completion Checklist
 
-### Phase 1: Foundation ✓
+### Phase 1: Foundation
 
 - [ ] Task 1.1: Database Schema
 - [ ] Task 1.2: Connection Pool
 - [ ] Task 1.3: Environment Config
 
-### Phase 2: Telegram Integration ✓
+### Phase 2: Telegram Integration
 
 - [ ] Task 2.1: Client Initialization
 - [ ] Task 2.2: Message Scanner
 - [ ] Task 2.3: Topic Manager
 - [ ] Task 2.4: Media Uploader
 
-### Phase 3: Processing Pipeline ✓
+### Phase 3: Processing Pipeline
 
 - [ ] Task 3.1: Media Downloader
 - [ ] Task 3.2: Face Processor
@@ -1195,14 +1232,14 @@ Validate system performance meets requirements.
 - [ ] Task 3.4: Identity Matcher
 - [ ] Task 3.5: Processing Queue
 
-### Phase 4: Dashboard ✓
+### Phase 4: Dashboard
 
 - [ ] Task 4.1: Main Dashboard
 - [ ] Task 4.2: Gallery View
 - [ ] Task 4.3: Detail View & Corrections
 - [ ] Task 4.4: Reverse Search
 
-### Phase 5: Deployment ✓
+### Phase 5: Deployment
 
 - [ ] Task 5.1: Docker Configuration
 - [ ] Task 5.2: Update Checker
@@ -1210,20 +1247,12 @@ Validate system performance meets requirements.
 - [ ] Task 5.4: Chat Management
 - [ ] Task 5.5: Main Entry Point
 - [ ] Task 5.6: Documentation
+- [ ] Task 5.7: Maintenance Scripts
 
-### Phase 6: Testing ✓
+### Phase 6: Testing
 
 - [ ] Task 6.1: Integration Tests
 - [ ] Task 6.2: Performance Validation
-
-### Phase 7: Bot-Based Architecture ✓
-
-- [x] Task 7.1: Login Bot with Auto-Delete
-  - Bot-based account registration (phone/code/2FA)
-  - Auto-delete all messages after 2 minutes for security
-  - 2FA passwords deleted immediately
-- [ ] Task 7.2: Use Bot Token for Topic/Publishing
-- [ ] Task 7.3: Auto-Scan All Dialogs (already implemented via discover_and_scan_all_chats)
 
 ---
 
@@ -1241,5 +1270,3 @@ When implementing these tasks:
 8. **Consider edge cases**: Empty results, network failures, invalid input, etc.
 9. **Follow the specifications**: The PRD parts 1-5 contain detailed requirements
 10. **Ask for clarification**: If a requirement is ambiguous, ask before implementing
-
----

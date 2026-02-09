@@ -77,8 +77,8 @@ class MediaUploader:
             The message_id of the uploaded media, or 0 on failure
         """
         # Check for duplicate
-        if await self._is_duplicate(source_message_id, source_chat_id):
-            logger.info(f"⏭️ Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id}")
+        if await self._is_duplicate(source_message_id, source_chat_id, db_topic_id):
+            logger.info(f"⏭️ Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id} to topic {db_topic_id}")
             return 0
         
         # Get topic info
@@ -202,14 +202,14 @@ class MediaUploader:
     
         return 0
     
-    async def _is_duplicate(self, source_message_id: int, source_chat_id: int) -> bool:
-        """Checks if this media has already been uploaded."""
+    async def _is_duplicate(self, source_message_id: int, source_chat_id: int, topic_id: int) -> bool:
+        """Checks if this media has already been uploaded to this specific topic."""
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     SELECT 1 FROM uploaded_media 
-                    WHERE source_message_id = %s AND source_chat_id = %s
-                """, (source_message_id, source_chat_id))
+                    WHERE source_message_id = %s AND source_chat_id = %s AND topic_id = %s
+                """, (source_message_id, source_chat_id, topic_id))
                 return await cur.fetchone() is not None
     
     async def _record_upload(
@@ -226,7 +226,7 @@ class MediaUploader:
                     INSERT INTO uploaded_media 
                         (source_message_id, source_chat_id, topic_id, hub_message_id)
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (source_chat_id, source_message_id) DO NOTHING
+                    ON CONFLICT (source_chat_id, source_message_id, topic_id) DO NOTHING
                 """, (source_message_id, source_chat_id, topic_id, hub_message_id))
     
     async def _generate_caption(self, source_chat_id: int, source_message_id: int) -> str:
