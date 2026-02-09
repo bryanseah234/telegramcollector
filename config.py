@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD: float = 0.55
     MIN_QUALITY_THRESHOLD: float = 0.5
     MAX_MEDIA_SIZE_MB: int = 50
-    NUM_WORKERS: int = 5
+    NUM_WORKERS: int = 4
     QUEUE_MAX_SIZE: int = 2000  # Backpressure limit (items) - increases with RAM
     USE_GPU: bool = False
     

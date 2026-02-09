@@ -162,6 +162,9 @@ class ProcessingQueue:
         self._processed_last_minute = 0
         self._processing_times: list = []  # Recent processing times for ETA
         
+        # Track last known Redis size to prevent false "empty" signals during glitches
+        self._last_known_redis_size: int = 0
+        
         # Statistics
         self.stats = {
             'processed': 0,
@@ -305,16 +308,24 @@ class ProcessingQueue:
         self._check_backpressure()
         logger.debug(f"Enqueued profile photo for user {user_id}")
     
+    
     def _check_backpressure(self):
         """Checks queue size and updates backpressure state."""
+        queue_size = 0
+        
         if self.redis_available:
             try:
                 queue_size = self.redis_client.llen(self.queue_key)
+                # Success - update last known size
+                self._last_known_redis_size = queue_size
             except Exception:
                 self.redis_available = False
-                queue_size = self.fallback_queue.qsize()
+                # Fallback: Use max of local fallback and last known Redis size
+                # This prevents releasing backpressure during transient Redis failures
+                queue_size = max(self.fallback_queue.qsize(), self._last_known_redis_size)
         else:
-            queue_size = self.fallback_queue.qsize()
+            # Fallback mode
+            queue_size = max(self.fallback_queue.qsize(), self._last_known_redis_size)
             
         old_state = self._backpressure_state
         
@@ -363,14 +374,16 @@ class ProcessingQueue:
         Returns recommended delay in seconds based on queue pressure.
         Provides gradual slowdown instead of binary pause.
         """
+        queue_size = 0
+        
         if self.redis_available:
             try:
                 queue_size = self.redis_client.llen(self.queue_key)
             except Exception:
                 self.redis_available = False
-                queue_size = self.fallback_queue.qsize()
+                queue_size = max(self.fallback_queue.qsize(), self._last_known_redis_size)
         else:
-            queue_size = self.fallback_queue.qsize()
+            queue_size = max(self.fallback_queue.qsize(), self._last_known_redis_size)
             
         # Get dynamic high watermark
         high_water = get_dynamic_setting("QUEUE_MAX_SIZE", self.high_watermark)
