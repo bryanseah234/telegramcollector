@@ -12,6 +12,7 @@ import os
 import signal
 from typing import Dict, List
 from config import settings
+from hub_notifier import HubNotifier
 
 # Configure logging
 logging.basicConfig(
@@ -91,6 +92,11 @@ class MainWorker:
         )
         await self.processing_queue.start()
         logger.info(f"✓ Processing queue started with {num_workers} workers")
+        
+        # Phase 4: Hub Notifier (for status updates)
+        self.hub_notifier = HubNotifier.get_instance()
+        await self.hub_notifier.start()
+        logger.info("✓ Hub notifier started")
 
         # Phase 2: Load User Accounts (Multiple)
         from telegram_client import TelegramClientManager
@@ -188,6 +194,21 @@ class MainWorker:
             
         except Exception as e:
             logger.warning(f"Failed to send startup status: {e}")
+    
+    async def _send_shutdown_notification(self):
+        """Sends shutdown notification to Hub."""
+        try:
+            from bot_client import bot_client_manager
+            client = bot_client_manager.client
+            hub_id = settings.HUB_GROUP_ID
+            
+            if client and hub_id:
+                await client.send_message(
+                    hub_id, 
+                    "🛑 **System Shutting Down**\n\n_Graceful shutdown initiated..._"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to send shutdown notification: {e}")
     
     async def _auto_discover_sessions(self):
         """
@@ -520,6 +541,34 @@ class MainWorker:
         except Exception as e:
             checks['Identities'] = f'❌ Error: {str(e)[:50]}'
         
+        # 7. Dead Letter Queue (failed tasks)
+        try:
+            dlq_size = self.redis_client.llen(self.processing_queue.dead_letter_key)
+            if dlq_size > 100:
+                checks['Dead Letter Queue'] = f'⚠️ {dlq_size} failed tasks'
+                warnings.append('DLQ High')
+            elif dlq_size > 0:
+                checks['Dead Letter Queue'] = f'📋 {dlq_size} failed tasks'
+            else:
+                checks['Dead Letter Queue'] = '✅ Empty'
+        except Exception as e:
+            checks['Dead Letter Queue'] = f'❌ Error: {str(e)[:50]}'
+        
+        # 8. Memory Usage (if psutil available)
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            if mem_mb > 3000:  # > 3GB
+                checks['Memory'] = f'⚠️ {mem_mb:.0f} MB'
+                warnings.append('High Memory')
+            else:
+                checks['Memory'] = f'✅ {mem_mb:.0f} MB'
+        except ImportError:
+            pass  # psutil not available, skip memory check
+        except Exception:
+            pass
+        
         # Build report
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
@@ -550,9 +599,12 @@ class MainWorker:
         """Gracefully shuts down all components."""
         logger.info("Shutting down...")
         
-        # Stop realtime scanner (if implemented stop method)
-        # if hasattr(self, 'realtime_scanner'):
-        #     await self.realtime_scanner.stop()
+        # Send shutdown notification
+        await self._send_shutdown_notification()
+        
+        # Stop hub notifier (flushes pending events)
+        if hasattr(self, 'hub_notifier'):
+            await self.hub_notifier.stop()
         
         # Stop processing queue
         if self.processing_queue:

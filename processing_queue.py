@@ -10,12 +10,25 @@ Includes queue backpressure for adaptive scan rate control.
 import logging
 import asyncio
 import io
+import json
+import base64
+import time
+import gc
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 import os
+
+try:
+    import redis
+except ImportError:
+    redis = None
+
 from database import get_db_connection
+from hub_notifier import notify, increment_stat
+from resilience import get_circuit_breaker, CircuitOpenError
+from config import settings, get_dynamic_setting
 
 logger = logging.getLogger(__name__)
 
@@ -91,16 +104,29 @@ class ProcessingQueue:
         self._workers = []
         self._running = False
         
-        # Redis Connection
-        from config import settings
-        import redis
-        self.redis_client = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB,
-            password=settings.REDIS_PASSWORD,
-            decode_responses=False  # Keep as bytes for binary content
-        )
+        # Redis Connection with Fallback
+        self.redis_available = False
+        self.fallback_queue = asyncio.Queue()  # In-memory fallback
+        
+        try:
+            if redis is None:
+                raise ImportError("redis package not installed")
+
+            self.redis_client = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD,
+                decode_responses=False  # Keep as bytes for binary content
+            )
+            self.redis_client.ping()
+            self.redis_available = True
+            logger.info(f"ProcessingQueue initialized with {num_workers} workers [Redis Connected]")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}. Using in-memory fallback.")
+            self.redis_client = None
+            self.redis_available = False
+            
         self.queue_key = "processing_queue:tasks"
         
         # Backpressure configuration
@@ -108,6 +134,11 @@ class ProcessingQueue:
         self.low_watermark = low_watermark
         self._backpressure_state = BackpressureState.NORMAL
         self._backpressure_callbacks: list = []
+        
+        # Adaptive backpressure tracking
+        self._per_chat_times: Dict[int, float] = {}  # chat_id -> avg processing time
+        self._processed_last_minute = 0
+        self._processing_times: list = []  # Recent processing times for ETA
         
         # Statistics
         self.stats = {
@@ -117,20 +148,26 @@ class ProcessingQueue:
             'errors': 0
         }
         
-        try:
-            self.redis_client.ping()
-            logger.info(f"ProcessingQueue initialized with {num_workers} workers [Redis Connected]")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise
-        
         # Dead letter queue for failed tasks
         self.dead_letter_key = "processing_queue:dead_letter"
         self.max_task_retries = 3
         
         # Task execution timeout (prevent stuck workers)
         self.task_timeout_seconds = 300  # 5 minutes max per task
+        
+        # Worker memory limit (MB)
+        # Worker memory limit (MB)
+        self.worker_memory_limit_mb = 2048
 
+    def _get_trace_id(self):
+        """Helper to get current trace ID or generate new one."""
+        try:
+            from observability import get_trace_id
+            return get_trace_id()
+        except ImportError:
+            import uuid
+            return str(uuid.uuid4())
+            
     async def start(self):
         """Starts the worker pool."""
         self._running = True
@@ -169,8 +206,6 @@ class ProcessingQueue:
         file_unique_id: str = None
     ):
         """Enqueues media for face processing."""
-        import json
-        import base64
         
         content.seek(0)
         content_b64 = base64.b64encode(content.read()).decode('ascii')
@@ -181,18 +216,30 @@ class ProcessingQueue:
             'message_id': message_id,
             'content_b64': content_b64,
             'media_type': media_type,
-            'file_unique_id': file_unique_id
+            'file_unique_id': file_unique_id,
+            'metadata': {
+                'trace_id': self._get_trace_id()
+            }
         }
         
-        # Push to Redis list (Right Push)
-        # Run in executor to avoid blocking asyncio loop with sync Redis call
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, 
-            self.redis_client.rpush, 
-            self.queue_key, 
-            json.dumps(task_data)
-        )
+        if self.redis_available:
+            # Push to Redis list (Right Push)
+            # Run in executor to avoid blocking asyncio loop with sync Redis call
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(
+                    None, 
+                    self.redis_client.rpush, 
+                    self.queue_key, 
+                    json.dumps(task_data)
+                )
+            except Exception as e:
+                logger.error(f"Redis enqueue failed: {e}. Switching to fallback.")
+                self.redis_available = False
+                await self.fallback_queue.put(json.dumps(task_data))
+        else:
+            # Use in-memory fallback
+            await self.fallback_queue.put(json.dumps(task_data))
         
         self._check_backpressure()
         logger.debug(f"Enqueued {media_type} from chat {chat_id}, msg {message_id}")
@@ -203,8 +250,6 @@ class ProcessingQueue:
         content: io.BytesIO
     ):
         """Enqueues a profile photo for face processing."""
-        import json
-        import base64
         
         content.seek(0)
         content_b64 = base64.b64encode(content.read()).decode('ascii')
@@ -213,28 +258,51 @@ class ProcessingQueue:
             'task_type': TaskType.PROFILE_PHOTO.value,
             'user_id': user_id,
             'content_b64': content_b64,
-            'media_type': 'photo'
+            'media_type': 'photo',
+            'metadata': {
+                'trace_id': self._get_trace_id()
+            }
         }
         
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, 
-            self.redis_client.rpush, 
-            self.queue_key, 
-            json.dumps(task_data)
-        )
+        if self.redis_available:
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(
+                    None, 
+                    self.redis_client.rpush, 
+                    self.queue_key, 
+                    json.dumps(task_data)
+                )
+            except Exception as e:
+                logger.error(f"Redis enqueue failed: {e}. Switching to fallback.")
+                self.redis_available = False
+                await self.fallback_queue.put(json.dumps(task_data))
+        else:
+            await self.fallback_queue.put(json.dumps(task_data))
         
         self._check_backpressure()
         logger.debug(f"Enqueued profile photo for user {user_id}")
     
     def _check_backpressure(self):
         """Checks queue size and updates backpressure state."""
-        queue_size = self.redis_client.llen(self.queue_key)
+        if self.redis_available:
+            try:
+                queue_size = self.redis_client.llen(self.queue_key)
+            except Exception:
+                self.redis_available = False
+                queue_size = self.fallback_queue.qsize()
+        else:
+            queue_size = self.fallback_queue.qsize()
+            
         old_state = self._backpressure_state
         
-        if queue_size >= self.high_watermark:
+        # Get dynamic high watermark
+        dynamic_high = get_dynamic_setting("QUEUE_MAX_SIZE", self.high_watermark)
+        dynamic_low = int(dynamic_high * 0.2)  # Maintain ratio
+        
+        if queue_size >= dynamic_high:
             self._backpressure_state = BackpressureState.CRITICAL
-        elif queue_size >= self.low_watermark:
+        elif queue_size >= dynamic_low:
             self._backpressure_state = BackpressureState.WARNING
         else:
             self._backpressure_state = BackpressureState.NORMAL
@@ -268,34 +336,140 @@ class ProcessingQueue:
         """Returns True if scanners should pause completely."""
         return self._backpressure_state == BackpressureState.CRITICAL
     
+    def get_adaptive_delay(self) -> float:
+        """
+        Returns recommended delay in seconds based on queue pressure.
+        Provides gradual slowdown instead of binary pause.
+        """
+        if self.redis_available:
+            try:
+                queue_size = self.redis_client.llen(self.queue_key)
+            except Exception:
+                self.redis_available = False
+                queue_size = self.fallback_queue.qsize()
+        else:
+            queue_size = self.fallback_queue.qsize()
+            
+        # Get dynamic high watermark
+        high_water = get_dynamic_setting("QUEUE_MAX_SIZE", self.high_watermark)
+        
+        if queue_size < high_water * 0.5:
+            return 0.0  # Full speed
+        elif queue_size < high_water * 0.75:
+            return 1.0  # Light slowdown
+        elif queue_size < high_water:
+            return 3.0  # Moderate slowdown
+        else:
+            return 5.0  # Heavy slowdown (but not paused)
+    
+    def get_chat_delay(self, chat_id: int) -> float:
+        """
+        Returns additional delay for a specific chat based on its processing history.
+        Slow chats get extra delay to prevent blocking others.
+        """
+        if chat_id not in self._per_chat_times:
+            return 0.0
+        
+        avg_time = self._per_chat_times[chat_id]
+        if avg_time > 10.0:  # Very slow chat (>10s per item)
+            return 2.0
+        elif avg_time > 5.0:  # Slow chat
+            return 1.0
+        return 0.0
+    
+    def record_processing_time(self, chat_id: int, duration: float):
+        """Records processing time for a chat for adaptive throttling."""
+        # Update per-chat average (exponential moving average)
+        if chat_id in self._per_chat_times:
+            self._per_chat_times[chat_id] = 0.8 * self._per_chat_times[chat_id] + 0.2 * duration
+        else:
+            self._per_chat_times[chat_id] = duration
+        
+        # Track for ETA calculation
+        self._processing_times.append(duration)
+        if len(self._processing_times) > 100:
+            self._processing_times.pop(0)
+    
+    def get_queue_eta(self) -> Optional[float]:
+        """
+        Estimates time to process current queue in minutes.
+        Returns None if not enough data.
+        """
+        if len(self._processing_times) < 5:
+            return None
+        
+        queue_size = self.redis_client.llen(self.queue_key)
+        if queue_size == 0:
+            return 0.0
+        
+        avg_time = sum(self._processing_times) / len(self._processing_times)
+        eta_seconds = queue_size * avg_time / self.num_workers
+        return eta_seconds / 60  # Convert to minutes
+    
     async def _worker(self, worker_id: int):
         """Worker coroutine that processes tasks from the Redis queue."""
         logger.info(f"Worker {worker_id} started")
-        import json
-        import base64
         
         loop = asyncio.get_event_loop()
         
         while self._running:
             try:
+                # Check memory limit
+                if self._check_worker_memory():
+                    logger.warning(f"Worker {worker_id} exceeded memory limit ({self.worker_memory_limit_mb}MB)")
+                    # Instead of crashing, clear caches and run GC
+                    gc.collect()
+                    # If still over limit, log warning
+                    if self._check_worker_memory():
+                        logger.error(f"Worker {worker_id} still over memory after GC, consider restart")
+                
                 # Update heartbeat
                 await self._update_heartbeat(worker_id)
                 
-                # Fetch task from Redis (Left Pop with blocking)
-                # We use blpop with a timeout to allow checking _running flag
-                # Run in executor because redis-py is sync
-                result = await loop.run_in_executor(
-                    None,
-                    self.redis_client.blpop,
-                    self.queue_key,
-                    1  # 1 second timeout
-                )
+                # Fetch task
+                task_json = None
+                
+                if self.redis_available:
+                    try:
+                        # Fetch task from Redis (Left Pop with blocking)
+                        result = await loop.run_in_executor(
+                            None,
+                            self.redis_client.blpop,
+                            self.queue_key,
+                            1  # 1 second timeout
+                        )
+                        
+                        if result:
+                            _, task_json = result
+                            
+                    except Exception as e:
+                        logger.error(f"Redis fetch failed: {e}. Switching to fallback.")
+                        self.redis_available = False
+                        # Try fallback immediately
+                        if not self.fallback_queue.empty():
+                            task_json = await self.fallback_queue.get()
+                else:
+                    # Redis unavailable - try fallback queue
+                    try:
+                        # Check if Redis is back (every 30s roughly)
+                        if worker_id == 0 and int(time.time()) % 30 == 0:
+                            self._try_reconnect_redis()
+                            
+                        # Non-blocking get from fallback
+                        task_json = self.fallback_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        await asyncio.sleep(1)
+                        continue
+                
+                if not task_json:
+                    continue
                 
                 if not result:
                     continue
                     
-                # result is tuple (key, value)
-                _, task_json = result
+                # Decode if bytes (Redis) or str (Fallback)
+                if isinstance(task_json, bytes):
+                    task_json = task_json.decode('utf-8')
                 
                 task_data = json.loads(task_json)
                 
@@ -314,13 +488,44 @@ class ProcessingQueue:
                 )
                 
                 try:
-                    # Add timeout protection to prevent stuck workers
-                    await asyncio.wait_for(
-                        self._process_task(task, worker_id),
-                        timeout=self.task_timeout_seconds
-                    )
+                    # Update queue depth metric
+                    from observability import update_queue_gauge, TraceContext, set_trace_id, get_trace_id
+                    
+                    if self.redis_available:
+                        try:
+                            q_len = self.redis_client.llen(self.queue_key)
+                            update_queue_gauge(q_len)
+                        except:
+                            pass
+                    else:
+                        update_queue_gauge(self.fallback_queue.qsize())
+                        
+                    # Generate/propagate trace ID
+                    # (In a real scenario, extract from task_data metadata if present)
+                    trace_id = task_data.get('metadata', {}).get('trace_id')
+                    if trace_id:
+                        set_trace_id(trace_id)
+                    else:
+                        trace_id = get_trace_id()
+                        
+                    # Track processing time for adaptive throttling AND Prometheus
+                    with TraceContext("ProcessTask", task_type=task_data.get('task_type'), chat_id=task_data.get('chat_id')):
+                        start_time = time.time()
+                        
+                        # Add timeout protection to prevent stuck workers
+                        await asyncio.wait_for(
+                            self._process_task(task, worker_id),
+                            timeout=self.task_timeout_seconds
+                        )
+                        
+                        # Record processing duration for per-chat throttling
+                        duration = time.time() - start_time
+                        self.record_processing_time(task.chat_id, duration)
+                    
                     self.stats['processed'] += 1
                 except asyncio.TimeoutError:
+                    from observability import record_error
+                    record_error("TimeoutError")
                     logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s")
                     self.stats['errors'] += 1
                     await self._move_to_dead_letter(task_data, "timeout")
@@ -345,8 +550,6 @@ class ProcessingQueue:
             task_data: Original task data dict
             error_reason: Description of why the task failed
         """
-        import json
-        
         try:
             # Add failure metadata
             task_data['_failure_reason'] = error_reason
@@ -379,6 +582,10 @@ class ProcessingQueue:
             )
             
             logger.warning(f"Task moved to dead letter queue: {error_reason}")
+            
+            # Notify Hub about task failure (immediate alert)
+            await notify('error', f"Task failed: {error_reason[:80]}", priority=2)
+            await increment_stat('errors_count', 1)
         except Exception as e:
             logger.error(f"Failed to move task to dead letter queue: {e}")
 
@@ -391,6 +598,25 @@ class ProcessingQueue:
             self.redis_client.setex(key, 300, timestamp)
         except Exception as e:
             logger.warning(f"Failed to update heartbeat for worker {worker_id}: {e}")
+    
+    def _check_worker_memory(self) -> bool:
+        """
+        Checks if worker process exceeds memory limit.
+        
+        Returns:
+            True if memory exceeds limit, False otherwise
+        """
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            return mem_mb > self.worker_memory_limit_mb
+        except ImportError:
+            # psutil not available, skip check
+            return False
+        except Exception as e:
+            logger.debug(f"Memory check failed: {e}")
+            return False
 
     async def _monitor_heartbeats(self):
         """Monitors worker heartbeats and alerts on stalls."""
@@ -428,6 +654,50 @@ class ProcessingQueue:
                 break
             except Exception as e:
                 logger.error(f"Heartbeat monitor error: {e}")
+                await asyncio.sleep(60)
+
+    def _try_reconnect_redis(self):
+        """Attempts to reconnect to Redis if connection was lost."""
+        if self.redis_available:
+            return
+            
+        logger.info("Attempting to reconnect to Redis...")
+        try:
+            # Recreate client
+            if redis is None:
+                return
+
+            self.redis_client = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD,
+                decode_responses=False
+            )
+            self.redis_client.ping()
+            self.redis_available = True
+            logger.info("✅ Redis reconnected! Draining fallback queue...")
+            
+            # Drain fallback queue to Redis
+            count = 0
+            while not self.fallback_queue.empty():
+                try:
+                    task_json = self.fallback_queue.get_nowait()
+                    self.redis_client.rpush(self.queue_key, task_json)
+                    count += 1
+                except asyncio.QueueEmpty:
+                    break
+                except Exception as e:
+                    logger.error(f"Error draining fallback queue: {e}")
+                    # Put back if possible, or log as lost
+                    break
+            
+            if count > 0:
+                logger.info(f"Drained {count} tasks from in-memory fallback to Redis")
+                
+        except Exception as e:
+            logger.warning(f"Redis reconnection failed: {e}")
+
 
     async def _process_task(self, task: ProcessingTask, worker_id: int):
         """Processes a single task through the complete pipeline."""
@@ -493,10 +763,18 @@ class ProcessingQueue:
                     matched_topics.add(topic_id)
                     if is_new:
                         self.stats['new_identities'] += 1
+                        # Notify Hub about new identity (high priority)
+                        await notify('face', f"🆕 New identity **Person {topic_id}** created!", priority=2)
                 else:
                     logger.debug(f"  → Face skipped (quality={face['quality']:.2f}, below threshold?)")
         
         logger.info(f"👥 Total: {total_faces_detected} faces detected → {len(matched_topics)} unique topic(s)")
+        
+        # Update stats for batched Hub notification
+        if total_faces_detected > 0:
+            await increment_stat('faces_detected', total_faces_detected)
+        if matched_topics:
+            await increment_stat('uploads_completed', len(matched_topics))
         
         # Step 4: Upload media to all matched topics
         if matched_topics and self.media_uploader:

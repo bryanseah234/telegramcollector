@@ -12,6 +12,8 @@ from telethon import events
 from telethon.tl.types import User, Chat, Channel, MessageMediaPhoto, MessageMediaDocument
 from telethon.errors import FloodWaitError
 from database import get_db_connection
+from hub_notifier import notify, increment_stat
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +110,17 @@ class MessageScanner:
         Saves progress every batch_size messages.
         """
         checkpoint = await self._get_checkpoint(account_id, chat_id)
-        last_id = checkpoint.get('last_processed_message_id', 0) if checkpoint else 0
+        if not checkpoint:
+            logger.warning(f"No checkpoint for chat {chat_id}")
+            return
+        
+        chat_title = checkpoint.get('chat_title', f'Chat {chat_id}')
+        chat_type = checkpoint.get('chat_type', 'group')
+        
+        # Notify Hub about scan start
+        await notify('scan', f"Started scanning {chat_type}: **{chat_title[:30]}**")
+        
+        last_id = (checkpoint.get('last_processed_message_id') or 0) if checkpoint else 0
         
         # Get total message count for progress tracking
         total_messages = await self._get_chat_message_count(chat_id)
@@ -237,7 +249,7 @@ class MessageScanner:
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    SELECT last_processed_message_id, processed_messages 
+                    SELECT last_processed_message_id, processed_messages, chat_title, chat_type
                     FROM scan_checkpoints 
                     WHERE account_id = %s AND chat_id = %s
                 """, (account_id, chat_id))
@@ -245,7 +257,9 @@ class MessageScanner:
                 if row:
                     return {
                         'last_processed_message_id': row[0] or 0,
-                        'processed_messages': row[1] or 0
+                        'processed_messages': row[1] or 0,
+                        'chat_title': row[2],
+                        'chat_type': row[3]
                     }
                 return None
 
@@ -260,18 +274,37 @@ class MessageScanner:
                         last_updated = NOW()
                     WHERE account_id = %s AND chat_id = %s
                 """, (message_id, processed, account_id, chat_id))
+        
+        # Milestone notification (every N messages)
+        milestone_interval = getattr(settings, 'NOTIFY_MILESTONE_INTERVAL', 1000)
+        if processed > 0 and processed % milestone_interval == 0:
+            await notify('scan', f"📊 Progress: {processed} messages scanned")
+        
+        # Update stats
+        await increment_stat('messages_scanned', 1)
 
     async def _mark_chat_complete(self, account_id: int, chat_id: int, total_processed: int):
         """Marks a chat as fully scanned."""
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
+                # Get chat title for notification
+                await cur.execute(
+                    "SELECT chat_title FROM scan_checkpoints WHERE account_id = %s AND chat_id = %s",
+                    (account_id, chat_id)
+                )
+                row = await cur.fetchone()
+                chat_title = row[0] if row else f'Chat {chat_id}'
+                
                 await cur.execute("""
                     UPDATE scan_checkpoints 
-                    SET scan_mode = 'realtime',
-                        processed_messages = %s,
-                        last_updated = NOW()
+                    SET scan_mode = 'realtime', is_complete = true, last_updated = NOW()
                     WHERE account_id = %s AND chat_id = %s
-                """, (total_processed, account_id, chat_id))
+                """, (account_id, chat_id))
+        
+        logger.info(f"Chat {chat_id} marked complete ({total_processed} messages)")
+        
+        # Notify Hub about completion
+        await notify('scan', f"✅ Completed **{chat_title[:30]}**: {total_processed} messages scanned")
 
     async def _get_chat_message_count(self, chat_id: int) -> int:
         """Gets total message count for a chat (for progress tracking)."""

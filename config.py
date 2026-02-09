@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, Any
 
 class Settings(BaseSettings):
     # Telegram API
@@ -37,6 +37,24 @@ class Settings(BaseSettings):
     LOGIN_BOT_ID: Optional[str] = None
     SESSIONS_DIR: str = "sessions"  # Directory for session files
     
+    # Resilience
+    CIRCUIT_BREAKER_THRESHOLD: int = 5  # Failures before opening circuit
+    CIRCUIT_BREAKER_TIMEOUT: int = 60   # Seconds before retry (OPEN -> HALF_OPEN)
+    MAX_RETRY_ATTEMPTS: int = 3
+    RETRY_BASE_DELAY: float = 1.0
+    
+    # Hub Notifications
+    HUB_NOTIFY_BATCH_INTERVAL: int = 60  # Seconds between batched notifications
+    HUB_NOTIFY_RATE_LIMIT: int = 10      # Max messages per minute
+    NOTIFY_ON_NEW_IDENTITY: bool = True
+    NOTIFY_ON_SCAN_MILESTONE: bool = True
+    NOTIFY_MILESTONE_INTERVAL: int = 1000  # Messages between milestones
+    
+    # Observability
+    ENABLE_PROMETHEUS: bool = True
+    PROMETHEUS_PORT: int = 8000
+    LOG_FORMAT: str = "json"  # "json" or "text"
+    
     # Compatibility aliases
     @property
     def TELEGRAM_API_ID(self) -> int:
@@ -62,9 +80,60 @@ except Exception as e:
     print("CRITICAL CONFIGURATION ERROR")
     print("="*60)
     print(f"Error details: {e}")
-    print("\nThis usually means a required environment variable is missing.")
-    print("Please check your .env file against .env.template.")
-    print("Common missing variables: TG_API_ID, TG_API_HASH, BOT_TOKEN")
-    print("="*60 + "\n")
-    # Choosing to exit here is safer than running with broken config
+    # ... error handling ...
     sys.exit(1)
+
+try:
+    import redis
+except ImportError:
+    redis = None
+
+def get_dynamic_setting(key: str, default: Any) -> Any:
+    """
+    Fetches a setting with priority: Redis > Env/Config
+    """
+    if redis is None:
+        return default
+        
+    try:
+        # Use a separate client or reuse one if possible, but for config
+        # a new short-lived connection is safer to avoid circular imports of existing clients
+        r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True,
+            socket_connect_timeout=1
+        )
+        val = r.get(f"config:{key}")
+        if val is not None:
+            # Convert type based on default
+            if isinstance(default, bool):
+                return val.lower() == "true"
+            if isinstance(default, int):
+                return int(val)
+            if isinstance(default, float):
+                return float(val)
+            return val
+    except Exception:
+        pass
+    return default
+
+def set_dynamic_setting(key: str, value: Any):
+    """Sets a dynamic setting in Redis."""
+    if redis is None:
+        print("Redis not installed, cannot set dynamic setting")
+        return
+
+    try:
+        r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True
+        )
+        r.set(f"config:{key}", str(value))
+    except Exception as e:
+        print(f"Failed to set dynamic setting: {e}")

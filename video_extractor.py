@@ -71,6 +71,9 @@ class VideoFrameExtractor:
         is_round_video: bool
     ) -> List[np.ndarray]:
         """Synchronous frame extraction (runs in thread pool)."""
+        container = None
+        raw_frames = []
+        
         try:
             video_buffer.seek(0)
             container = self.av.open(video_buffer)
@@ -84,22 +87,22 @@ class VideoFrameExtractor:
             
             # Determine extraction strategy
             if is_round_video:
-                frames = self._extract_at_fps(container, stream, self.round_video_fps)
+                raw_frames = self._extract_at_fps(container, stream, self.round_video_fps)
             elif duration < 30:
-                frames = self._extract_at_fps(container, stream, self.default_fps)
+                raw_frames = self._extract_at_fps(container, stream, self.default_fps)
             else:
-                frames = self._extract_keyframes(container, stream)
-            
-            container.close()
+                raw_frames = self._extract_keyframes(container, stream)
             
             # Convert to BGR numpy arrays
             bgr_frames = []
-            for frame in frames[:self.max_frames]:
+            import cv2
+            for frame in raw_frames[:self.max_frames]:
                 rgb_array = frame.to_ndarray(format='rgb24')
-                # RGB to BGR for OpenCV/InsightFace
-                import cv2
                 bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
                 bgr_frames.append(bgr_array)
+                
+                # Explicitly delete intermediate arrays
+                del rgb_array
             
             logger.info(f"Extracted {len(bgr_frames)} frames (round={is_round_video}, duration={duration:.1f}s)")
             return bgr_frames
@@ -107,6 +110,26 @@ class VideoFrameExtractor:
         except Exception as e:
             logger.error(f"Frame extraction failed: {e}")
             return []
+            
+        finally:
+            # Explicit cleanup to prevent memory leaks
+            if container:
+                container.close()
+            
+            # Clear raw frames
+            for frame in raw_frames:
+                del frame
+            raw_frames.clear()
+            
+            # Force garbage collection for large video buffers
+            import gc
+            gc.collect()
+            
+            # Reset buffer position for potential reuse
+            try:
+                video_buffer.seek(0)
+            except:
+                pass
     
     def _extract_at_fps(self, container, stream, target_fps: float) -> List:
         """Extracts frames at a fixed FPS rate."""

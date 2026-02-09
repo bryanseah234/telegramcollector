@@ -11,6 +11,7 @@ import os
 from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument
 from telethon.errors import FloodWaitError
 from database import get_db_connection
+from hub_notifier import notify, increment_stat
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,10 @@ class MediaUploader:
                 await self.topic_manager.increment_message_count(db_topic_id)
                 
                 logger.info(f"Uploaded media to topic {telegram_topic_id}, message {message.id}")
+            
+                # Track successful upload for Hub stats
+                await increment_stat('uploads_completed', 1)
+            
                 return message.id
                 
             except FloodWaitError as e:
@@ -190,6 +195,11 @@ class MediaUploader:
                     await asyncio.sleep(delay)
         
         logger.error(f"Failed to upload after {self.max_retries} attempts")
+    
+        # Notify Hub about upload failure (immediate alert)
+        await notify('error', f"Upload failed after {self.max_retries} retries", priority=1)
+        await increment_stat('errors_count', 1)
+    
         return 0
     
     async def _is_duplicate(self, source_message_id: int, source_chat_id: int) -> bool:

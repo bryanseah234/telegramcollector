@@ -8,12 +8,17 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=os.getenv('LOG_LEVEL', 'INFO')
-)
+# Configure logging and observability
+from config import settings
+from observability import setup_logging, start_metrics_server
+
+# Setup structured logging
+setup_logging(log_level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger(__name__)
+
+# Start Prometheus metrics server
+if settings.ENABLE_PROMETHEUS:
+    start_metrics_server(settings.PROMETHEUS_PORT)
 
 # Import components
 from database import validate_configuration, get_db_connection, db_pool
@@ -23,7 +28,7 @@ from media_processor import MediaManager
 from processing_queue import ProcessingQueue
 from face_processor import FaceProcessor
 from clustering import FaceClusterer
-from worker import queue_worker
+from dlq_processor import DLQProcessor
 
 async def main():
     # 1. Validate Configuration
@@ -41,11 +46,43 @@ async def main():
     face_processor = FaceProcessor()
     clusterer = FaceClusterer()
     
+    # Connect dependencies
+    # Note: ProcessingQueue internally needs these if we passed them, but default init is None?
+    # Checking ProcessingQueue init: it takes them as args. 
+    # access them via setters or re-init?
+    # processing_queue = ProcessingQueue(face_processor, ...)
+    # Let's re-initialize properly.
+    
+    # Re-init ProcessingQueue with dependencies
+    from topic_manager import TopicManager
+    from media_uploader import MediaUploader
+    from video_extractor import VideoFrameExtractor
+    from identity_matcher import IdentityMatcher
+    
+    # We need bot client for TopicManager/MediaUploader
+    from bot_client import bot_client_manager
+    await bot_client_manager.start()
+    
+    topic_manager = TopicManager()
+    media_uploader = MediaUploader(topic_manager)
+    video_extractor = VideoFrameExtractor()
+    identity_matcher = IdentityMatcher(topic_manager)
+    
+    processing_queue = ProcessingQueue(
+        face_processor=face_processor,
+        video_extractor=video_extractor,
+        identity_matcher=identity_matcher,
+        media_uploader=media_uploader,
+        topic_manager=topic_manager,
+        num_workers=settings.NUM_WORKERS,
+        high_watermark=settings.QUEUE_MAX_SIZE
+    )
+    
+    # DLQ Processor
+    dlq_processor = DLQProcessor(processing_queue.redis_client, processing_queue)
+    
     # Scanner
     scanner = MessageScanner(tg_manager.client, processing_queue, media_manager)
-    
-    # Worker
-    worker = queue_worker(processing_queue, face_processor, clusterer, tg_manager.client)
 
     # 3. Start Services
     logger.info("Starting services...")
@@ -53,8 +90,11 @@ async def main():
     # Start Telegram Client
     await tg_manager.start()
     
-    # Start Worker (as background task)
-    worker_task = asyncio.create_task(worker.run())
+    # Start Processing Queue Workers
+    await processing_queue.start()
+    
+    # Start DLQ Processor
+    await dlq_processor.start()
     
     # 4. Discovery & Scanning
     # Get own account ID (or create one in DB)
@@ -78,7 +118,8 @@ async def main():
         pass
     finally:
         logger.info("Shutting down...")
-        worker_task.cancel()
+        await processing_queue.stop()
+        await dlq_processor.stop()
         if db_pool:
             db_pool.close_all()
 

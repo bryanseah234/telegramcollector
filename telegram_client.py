@@ -9,15 +9,34 @@ from telethon.errors import (
     UserDeactivatedError
 )
 import os
+from enum import Enum
 from database import get_db_connection
 
 logger = logging.getLogger(__name__)
 
 
+class ConnectionState(Enum):
+    """States for Telegram client connection state machine."""
+    DISCONNECTED = 'disconnected'      # Not connected to Telegram
+    CONNECTING = 'connecting'          # Attempting to connect
+    CONNECTED = 'connected'            # Connected and authorized
+    RECONNECTING = 'reconnecting'      # Lost connection, trying to recover
+    FLOOD_WAIT = 'flood_wait'          # Being rate limited
+    INVALID_SESSION = 'invalid_session'  # Session is revoked/invalid
+    PAUSED = 'paused'                  # Manually paused by user
+
+
 class TelegramClientManager:
     """
-    Manages the Telethon client connection and session.
+    Manages the Telethon client connection with state machine pattern.
     Handles initialization, authorization, health monitoring, and cleanup.
+    
+    State Transitions:
+        DISCONNECTED -> CONNECTING -> CONNECTED
+        CONNECTED -> DISCONNECTED (network loss)
+        CONNECTED -> RECONNECTING -> CONNECTED (auto-recovery)
+        CONNECTED -> FLOOD_WAIT -> CONNECTED (after wait)
+        * -> INVALID_SESSION (session revoked)
     """
     
     def __init__(self, session_name: str = 'user_session', api_id: int = None, api_hash: str = None):
@@ -27,28 +46,79 @@ class TelegramClientManager:
         self.session_name = session_name
         self._health_task = None
         self._is_healthy = False
+        self._state = ConnectionState.DISCONNECTED
+        self._state_change_callbacks = []
+        self._flood_wait_until = None
         
-        # Ensure session directory exists (use absolute path to match login_bot if possible, but relative works if CWD is /app)
-        # Note: login_bot now uses /app/sessions. worker.py also runs in /app.
-        # But let's log to be sure.
+        # Ensure session directory exists
         os.makedirs('sessions', exist_ok=True)
         session_path = os.path.join('sessions', session_name)
         
-        # Debug path
         logger.debug(f"Initializing client with session path: {os.path.abspath(session_path)}")
         
-        # Use SQLiteSession with increased timeout to prevent "database is locked" errors
-        # when multiple clients access session files concurrently
+        # Use SQLiteSession with increased timeout
         from telethon.sessions import SQLiteSession
         session = SQLiteSession(session_path)
         
-        # Set SQLite timeout to 30 seconds (default is 5)
-        # This allows concurrent operations to wait instead of failing immediately
         import sqlite3
         if hasattr(session, '_conn') and session._conn:
-            session._conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds
+            session._conn.execute("PRAGMA busy_timeout = 30000")
         
         self.client = TelegramClient(session, self.api_id, self.api_hash)
+    
+    @property
+    def state(self) -> ConnectionState:
+        """Returns the current connection state."""
+        return self._state
+    
+    async def _set_state(self, new_state: ConnectionState, reason: str = None):
+        """Transitions to a new state with logging and notifications."""
+        if self._state == new_state:
+            return
+        
+        old_state = self._state
+        self._state = new_state
+        
+        state_emoji = {
+            ConnectionState.DISCONNECTED: '🔴',
+            ConnectionState.CONNECTING: '🟡',
+            ConnectionState.CONNECTED: '🟢',
+            ConnectionState.RECONNECTING: '🟠',
+            ConnectionState.FLOOD_WAIT: '⏳',
+            ConnectionState.INVALID_SESSION: '❌',
+            ConnectionState.PAUSED: '⏸️'
+        }
+        
+        emoji = state_emoji.get(new_state, '❓')
+        logger.info(f"{emoji} Session {self.session_name}: {old_state.value} -> {new_state.value}" + 
+                   (f" ({reason})" if reason else ""))
+        
+        # Notify Hub for important state changes
+        critical_states = [ConnectionState.INVALID_SESSION, ConnectionState.FLOOD_WAIT, ConnectionState.DISCONNECTED]
+        if new_state in critical_states or old_state in critical_states:
+            try:
+                from hub_notifier import notify
+                message = f"{emoji} **{self.session_name}**: {new_state.value}"
+                if reason:
+                    message += f" - {reason}"
+                priority = 2 if new_state == ConnectionState.INVALID_SESSION else 1
+                await notify('system', message, priority=priority)
+            except Exception as e:
+                logger.debug(f"Could not notify Hub of state change: {e}")
+        
+        # Call registered callbacks
+        for callback in self._state_change_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(old_state, new_state)
+                else:
+                    callback(old_state, new_state)
+            except Exception as e:
+                logger.error(f"State change callback error: {e}")
+    
+    def on_state_change(self, callback):
+        """Registers a callback for state changes."""
+        self._state_change_callbacks.append(callback)
     
     async def start(self, phone: str = None):
         """
@@ -57,6 +127,8 @@ class TelegramClientManager:
         Args:
             phone: Phone number for first-time authorization (optional if session exists)
         """
+        await self._set_state(ConnectionState.CONNECTING)
+        
         try:
             await self.client.connect()
             
@@ -66,7 +138,6 @@ class TelegramClientManager:
                     logger.info(f"Authorizing with phone: {phone}")
                     await self.client.start(phone=phone)
                 else:
-                    # Prompt for phone in interactive mode
                     await self.client.start()
             
             # Verify we're logged in
@@ -74,6 +145,7 @@ class TelegramClientManager:
             if me:
                 logger.info(f"Telegram client started. Logged in as: {me.first_name} (@{me.username or 'N/A'})")
                 self._is_healthy = True
+                await self._set_state(ConnectionState.CONNECTED)
             else:
                 raise RuntimeError("Failed to get user info after authorization")
             
@@ -86,18 +158,18 @@ class TelegramClientManager:
             return me
 
         except (SessionRevokedError, AuthKeyError, UserDeactivatedError) as e:
-            logger.error(f"Session is invalid/revoked: {e}")
+            await self._set_state(ConnectionState.INVALID_SESSION, str(e))
             await self._handle_invalid_session()
-            raise  # Re-raise so the caller (worker.py) knows to skip this account
+            raise
         
         except FloodWaitError as e:
-            logger.warning(f"⏳ FloodWait starting client. Waiting {e.seconds}s...")
+            await self._set_state(ConnectionState.FLOOD_WAIT, f"Waiting {e.seconds}s")
+            self._flood_wait_until = asyncio.get_event_loop().time() + e.seconds
             await asyncio.sleep(e.seconds)
-            # Retry connection after wait
             return await self.start(phone)
             
         except Exception as e:
-            logger.error(f"Failed to start telegram client: {e}")
+            await self._set_state(ConnectionState.DISCONNECTED, str(e))
             raise
 
     async def _handle_invalid_session(self):
@@ -105,18 +177,12 @@ class TelegramClientManager:
         Handles cleanup for invalid sessions:
         1. Updates DB status to 'paused' (not 'invalid') to preserve checkpoints
         2. Does NOT delete session file - user can re-login via Login Bot
-        
-        This failsafe ensures:
-        - Scan progress (checkpoints) is preserved
-        - User can re-authenticate and resume where they left off
         """
         try:
-            # Construct standard path
             session_file_path = os.path.join('sessions', f"{self.session_name}.session")
             
             async with get_db_connection() as conn:
                 async with conn.cursor() as cur:
-                    # Mark as 'paused' instead of 'invalid' to preserve checkpoints
                     await cur.execute("""
                         UPDATE telegram_accounts 
                         SET status = 'paused', 
@@ -126,10 +192,14 @@ class TelegramClientManager:
                     """, (session_file_path, os.path.join('sessions', self.session_name)))
                     await conn.commit()
             
-            logger.warning(f"⚠️ Session {self.session_name} paused (logged out). Checkpoints preserved. Use Login Bot to re-authenticate.")
+            logger.warning(f"⚠️ Session {self.session_name} paused. Checkpoints preserved.")
             
-            # DO NOT delete session file - preserve for re-login
-            # The session file can be reused after user re-authenticates via Login Bot
+            # Notify Hub about invalid session
+            try:
+                from hub_notifier import notify
+                await notify('error', f"❌ Session **{self.session_name}** logged out - requires re-authentication", priority=2)
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"Error during session pause handling: {e}")
@@ -140,21 +210,20 @@ class TelegramClientManager:
         Uses exponential backoff for reconnection attempts.
         """
         MAX_RECONNECT_ATTEMPTS = 5
-        BASE_RECONNECT_DELAY = 5  # seconds
+        BASE_RECONNECT_DELAY = 5
         reconnect_attempts = 0
         
         while True:
             try:
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(60)
                 
                 if not self.client.is_connected():
-                    logger.warning("Connection lost. Attempting to reconnect...")
                     self._is_healthy = False
+                    await self._set_state(ConnectionState.RECONNECTING, f"Attempt {reconnect_attempts + 1}/{MAX_RECONNECT_ATTEMPTS}")
                     
-                    # Exponential backoff for reconnection
+                    # Exponential backoff
                     delay = BASE_RECONNECT_DELAY * (2 ** reconnect_attempts)
                     if reconnect_attempts > 0:
-                        logger.info(f"Reconnect attempt {reconnect_attempts + 1}/{MAX_RECONNECT_ATTEMPTS} after {delay}s...")
                         await asyncio.sleep(delay)
                     
                     try:
@@ -162,18 +231,19 @@ class TelegramClientManager:
                         
                         if await self.client.is_user_authorized():
                             self._is_healthy = True
-                            reconnect_attempts = 0  # Reset on success
-                            logger.info("Reconnected successfully.")
+                            reconnect_attempts = 0
+                            await self._set_state(ConnectionState.CONNECTED, "Reconnected")
                         else:
-                            logger.error("Reconnected but not authorized. Session may have expired.")
                             reconnect_attempts += 1
+                            await self._set_state(ConnectionState.INVALID_SESSION, "Not authorized after reconnect")
+                    except FloodWaitError as e:
+                        await self._set_state(ConnectionState.FLOOD_WAIT, f"Waiting {e.seconds}s")
+                        await asyncio.sleep(e.seconds)
                     except Exception as conn_err:
                         reconnect_attempts += 1
-                        logger.warning(f"Reconnect failed: {conn_err}")
                         
                         if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
-                            logger.error(f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) reached. Giving up.")
-                            # Log to database
+                            await self._set_state(ConnectionState.DISCONNECTED, f"Max attempts reached: {conn_err}")
                             try:
                                 from database import log_processing_error
                                 await log_processing_error(
@@ -185,8 +255,11 @@ class TelegramClientManager:
                                 pass
                             break
                 else:
+                    # Connected - ensure state is correct
+                    if self._state != ConnectionState.CONNECTED:
+                        await self._set_state(ConnectionState.CONNECTED)
                     self._is_healthy = True
-                    reconnect_attempts = 0  # Reset when healthy
+                    reconnect_attempts = 0
                     
             except asyncio.CancelledError:
                 break

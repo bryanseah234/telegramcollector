@@ -8,6 +8,7 @@ import logging
 import os
 from typing import List, Dict, Tuple, Optional
 from database import get_db_connection
+from hub_notifier import increment_stat
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,11 @@ class IdentityMatcher:
                     """, (topic_id, embedding_str, quality_score, source_chat_id, source_message_id, frame_index))
                     
                     result = await cur.fetchone()
+                    
+                    # Track embedding storage for Hub stats
+                    if result:
+                        await increment_stat('faces_detected', 1)
+                    
                     return result[0] if result else 0
                 
         except Exception as e:

@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 from PIL import Image
 import io
+import time
+from config import settings, get_dynamic_setting
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +51,7 @@ class FaceProcessor:
         for attempt in range(MAX_RETRIES):
             try:
                 from insightface.app import FaceAnalysis
-                from config import settings
-                
+
                 # Use environment variable or default to CPU
                 if self.providers is None:
                     gpu_enabled = settings.USE_GPU
@@ -72,7 +73,6 @@ class FaceProcessor:
             except Exception as e:
                 logger.error(f"FaceProcessor init failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
                 if attempt < MAX_RETRIES - 1:
-                    import time
                     time.sleep(2 ** attempt)  # Exponential backoff
                 else:
                     logger.error("FaceProcessor initialization failed after max retries")
@@ -104,15 +104,43 @@ class FaceProcessor:
         if image_array is None:
             return []
         
-        # Run detection in thread pool (CPU-bound operation)
-        loop = asyncio.get_event_loop()
-        faces = await loop.run_in_executor(
-            self._executor, 
-            self._detect_faces_sync, 
-            image_array
-        )
-        
-        return faces
+        try:
+            # Run detection in thread pool (CPU-bound operation)
+            loop = asyncio.get_event_loop()
+            faces = await loop.run_in_executor(
+                self._executor, 
+                self._detect_faces_sync, 
+                image_array
+            )
+            return faces
+            
+        except (MemoryError, RuntimeError) as e:
+            logger.error(f"Face processing failed (resource error): {e}")
+            # Save for later retry if it's a resource issue
+            await self._save_for_retry(image_input)
+            return []
+        except Exception as e:
+            logger.error(f"Face processing unexpected error: {e}")
+            return []
+            
+    async def _save_for_retry(self, image_input):
+        """Saves failed image for later processing (e.g. after restart)."""
+        try:
+            # Save to disk as fallback
+            timestamp = int(time.time())
+            retry_dir = "failed_media_retry"
+            os.makedirs(retry_dir, exist_ok=True)
+            
+            filename = f"{retry_dir}/failed_{timestamp}.bin"
+            
+            # Get bytes
+            if isinstance(image_input, (io.BytesIO, bytes)):
+                data = image_input.getvalue() if isinstance(image_input, io.BytesIO) else image_input
+                with open(filename, "wb") as f:
+                    f.write(data)
+                logger.info(f"Saved failed media to {filename} for later retry")
+        except Exception as e:
+            logger.error(f"Failed to save media for retry: {e}")
     
     def _to_numpy(self, image_input) -> Optional[np.ndarray]:
         """Converts various image formats to numpy array (BGR)."""
@@ -161,9 +189,11 @@ class FaceProcessor:
             
             for face in faces:
                 # Quality filtering
+                dynamic_quality = get_dynamic_setting("MIN_QUALITY_THRESHOLD", self.min_quality)
+                
                 quality = float(face.det_score)
-                if quality < self.min_quality:
-                    logger.debug(f"Skipping low-quality face: {quality:.3f}")
+                if quality < dynamic_quality:
+                    logger.debug(f"Skipping low-quality face: {quality:.3f} < {dynamic_quality}")
                     continue
                 
                 face_dict = {

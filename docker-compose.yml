@@ -104,6 +104,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r = redis.Redis(host='redis'); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # Login Bot - handles user account registration
   login_bot:
@@ -163,7 +169,8 @@ services:
       - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.55}
       - USE_GPU=${USE_GPU:-false}
     ports:
-      - "8501:8501"
+      - "8501:8501"  # Streamlit Dashboard
+      - "8000:8000"  # Prometheus Metrics
     deploy:
       resources:
         limits:

@@ -408,6 +408,54 @@ def render_dashboard():
             st.dataframe(errors, hide_index=True)
         else:
             st.success("No recent errors!")
+    
+    # DLQ Section
+    st.divider()
+    st.subheader("🗂️ Dead Letter Queue")
+    
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True
+        )
+        
+        dlq_size = redis_client.llen("processing_queue:dead_letter")
+        permanent_failed = redis_client.llen("processing_queue:dlq_processed")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Failed Tasks", dlq_size)
+        with col2:
+            st.metric("Permanently Failed", permanent_failed)
+        with col3:
+            queue_size = redis_client.llen("processing_queue:tasks")
+            st.metric("Queue Size", queue_size)
+        
+        if dlq_size > 0:
+            # Get recent DLQ entries
+            import json
+            dlq_entries = redis_client.lrange("processing_queue:dead_letter", 0, 9)
+            
+            rows = []
+            for entry in dlq_entries:
+                try:
+                    data = json.loads(entry)
+                    rows.append({
+                        'Error': data.get('_failure_reason', 'Unknown')[:50],
+                        'Chat': data.get('chat_id', ''),
+                        'Time': data.get('_failed_at', '')[:19] if data.get('_failed_at') else ''
+                    })
+                except:
+                    pass
+            
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True)
+    except Exception as e:
+        st.warning(f"Redis not available: {e}")
 
 
 def render_gallery():
@@ -674,18 +722,82 @@ def render_settings():
     """Renders the settings page."""
     st.title("⚙️ Settings")
     
+    # Dynamic Configuration Section
+    st.header("Admin Controls")
+    st.info("Values changed here apply immediately across all workers (no restart needed).")
+    
+    from config import get_dynamic_setting, set_dynamic_setting, settings
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Face Recognition Models")
+        
+        # Similarity Threshold
+        current_sim = get_dynamic_setting("SIMILARITY_THRESHOLD", settings.SIMILARITY_THRESHOLD)
+        new_sim = st.slider(
+            "Similarity Threshold", 
+            min_value=0.1, 
+            max_value=0.9, 
+            value=float(current_sim),
+            step=0.01,
+            help="Higher = stricter matching (fewer false positives, more false negatives)."
+        )
+        if new_sim != float(current_sim):
+            set_dynamic_setting("SIMILARITY_THRESHOLD", new_sim)
+            st.toast(f"Updated Similarity Threshold to {new_sim}")
+            
+        # Quality Threshold
+        current_qual = get_dynamic_setting("MIN_QUALITY_THRESHOLD", settings.MIN_QUALITY_THRESHOLD)
+        new_qual = st.slider(
+            "Minimum Face Quality", 
+            min_value=0.1, 
+            max_value=0.9, 
+            value=float(current_qual),
+            step=0.01,
+            help="Minimum confidence score for a face to be processed."
+        )
+        if new_qual != float(current_qual):
+            set_dynamic_setting("MIN_QUALITY_THRESHOLD", new_qual)
+            st.toast(f"Updated Quality Threshold to {new_qual}")
+            
+    with col2:
+        st.subheader("System Performance")
+        
+        # Queue Max Size (Backpressure)
+        current_queue = get_dynamic_setting("QUEUE_MAX_SIZE", settings.QUEUE_MAX_SIZE)
+        new_queue = st.number_input(
+            "Max Queue Size (Backpressure)", 
+            min_value=100, 
+            max_value=10000, 
+            value=int(current_queue),
+            step=100,
+            help="Queue size above which processing slows down to prevent OOM."
+        )
+        if new_queue != int(current_queue):
+            set_dynamic_setting("QUEUE_MAX_SIZE", new_queue)
+            st.toast(f"Updated Max Queue Size to {new_queue}")
+            
+        if st.button("Reset All to Defaults"):
+            set_dynamic_setting("SIMILARITY_THRESHOLD", settings.SIMILARITY_THRESHOLD)
+            set_dynamic_setting("MIN_QUALITY_THRESHOLD", settings.MIN_QUALITY_THRESHOLD)
+            set_dynamic_setting("QUEUE_MAX_SIZE", settings.QUEUE_MAX_SIZE)
+            st.rerun()
+
+    st.divider()
+    
     st.subheader("System Information")
     
     # Environment info
     col1, col2 = st.columns(2)
     
     with col1:
-        st.text(f"Hub Group ID: {os.getenv('HUB_GROUP_ID', 'Not set')}")
-        st.text(f"Database: {os.getenv('DB_NAME', 'Not set')}")
+        st.text(f"Hub Group ID: {settings.HUB_GROUP_ID}")
+        st.text(f"Database: {settings.DB_NAME}")
     
     with col2:
-        st.text(f"Similarity Threshold: {os.getenv('SIMILARITY_THRESHOLD', '0.55')}")
-        st.text(f"GPU Enabled: {os.getenv('USE_GPU', 'false')}")
+        st.text(f"GPU Enabled: {settings.USE_GPU}")
+        st.text(f"Prometheus: {'Enabled' if settings.ENABLE_PROMETHEUS else 'Disabled'}")
     
     st.divider()
     
@@ -694,7 +806,7 @@ def render_settings():
     
     if st.button("Clear Dashboard Cache"):
         st.cache_data.clear()
-        st.success("Cache cleared!")
+        st.toast("Cache cleared!")
     
     st.divider()
     
