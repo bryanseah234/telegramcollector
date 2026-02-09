@@ -27,13 +27,13 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD: float = 0.55
     MIN_QUALITY_THRESHOLD: float = 0.5
     MAX_MEDIA_SIZE_MB: int = 50
-    NUM_WORKERS: int = 3
-    QUEUE_MAX_SIZE: int = 500  # Backpressure limit (items) - increases with RAM
+    NUM_WORKERS: int = 5
+    QUEUE_MAX_SIZE: int = 2000  # Backpressure limit (items) - increases with RAM
     USE_GPU: bool = False
     
     # Operational
     RUN_MODE: str = "both"  # backfill, realtime, both
-    HEALTH_CHECK_INTERVAL: int = 1800
+    HEALTH_CHECK_INTERVAL: int = 300
     LOGIN_BOT_ID: Optional[str] = None
     SESSIONS_DIR: str = "sessions"  # Directory for session files
     
@@ -44,11 +44,11 @@ class Settings(BaseSettings):
     RETRY_BASE_DELAY: float = 1.0
     
     # Hub Notifications
-    HUB_NOTIFY_BATCH_INTERVAL: int = 60  # Seconds between batched notifications
-    HUB_NOTIFY_RATE_LIMIT: int = 10      # Max messages per minute
+    HUB_NOTIFY_BATCH_INTERVAL: int = 30  # Seconds between batched notifications
+    HUB_NOTIFY_RATE_LIMIT: int = 100     # Max messages per minute
     NOTIFY_ON_NEW_IDENTITY: bool = True
     NOTIFY_ON_SCAN_MILESTONE: bool = True
-    NOTIFY_MILESTONE_INTERVAL: int = 1000  # Messages between milestones
+    NOTIFY_MILESTONE_INTERVAL: int = 500  # Messages between milestones
     
     # Observability
     ENABLE_PROMETHEUS: bool = True

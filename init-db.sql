@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS scan_checkpoints (
     total_messages INTEGER DEFAULT 0,
     processed_messages INTEGER DEFAULT 0,
     scan_mode VARCHAR(20) DEFAULT 'backfill' CHECK (scan_mode IN ('backfill', 'realtime')),
+    is_complete BOOLEAN DEFAULT FALSE,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(account_id, chat_id)
 );

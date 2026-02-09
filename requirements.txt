@@ -30,3 +30,9 @@ requests==2.31.0
 aiofiles==23.2.1
 pydantic-settings==2.2.1
 psycopg-pool==3.2.1
+
+
+# Observability
+prometheus_client==0.20.0
+python-json-logger==2.0.7
+psutil==5.9.8

@@ -96,9 +96,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 10G
         reservations:
           memory: 1G
+    ports:
+      - "9090:8000"  # Prometheus Metrics (Host 9090 -> Container 8000)
     logging:
       driver: "json-file"
       options:
@@ -170,7 +172,6 @@ services:
       - USE_GPU=${USE_GPU:-false}
     ports:
       - "8501:8501"  # Streamlit Dashboard
-      - "8000:8000"  # Prometheus Metrics
     deploy:
       resources:
         limits:
