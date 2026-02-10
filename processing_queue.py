@@ -175,7 +175,7 @@ class ProcessingQueue:
         
         # Dead letter queue for failed tasks
         self.dead_letter_key = "processing_queue:dead_letter"
-        self.max_task_retries = 3
+        self.max_task_retries = 10
         
         # Task execution timeout (prevent stuck workers)
         self.task_timeout_seconds = 300  # 5 minutes max per task
