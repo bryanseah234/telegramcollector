@@ -183,6 +183,11 @@ class ProcessingQueue:
         # Worker memory limit (MB)
         # Worker memory limit (MB)
         self.worker_memory_limit_mb = 2048
+        
+        # Active task tracking for debugging stuck workers
+        # Maps worker_id -> {start_time, task_info}
+        self._active_tasks = {}
+        self._monitor_task = None
 
     def _get_trace_id(self):
         """Helper to get current trace ID or generate new one."""
@@ -204,6 +209,9 @@ class ProcessingQueue:
         # Start heartbeat monitor
         self._heartbeat_monitor_task = asyncio.create_task(self._monitor_heartbeats())
         
+        # Start queue status monitor (New)
+        self._monitor_task = asyncio.create_task(self._monitor_queue_status())
+        
         logger.info(f"Started {self.num_workers} processing workers")
     
     async def stop(self):
@@ -216,6 +224,9 @@ class ProcessingQueue:
         
         if hasattr(self, '_heartbeat_monitor_task'):
             self._heartbeat_monitor_task.cancel()
+            
+        if self._monitor_task:
+            self._monitor_task.cancel()
         
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers = []
@@ -553,11 +564,26 @@ class ProcessingQueue:
                     with TraceContext("ProcessTask", task_type=task_data.get('task_type'), chat_id=task_data.get('chat_id')):
                         start_time = time.time()
                         
-                        # Add timeout protection to prevent stuck workers
-                        await asyncio.wait_for(
-                            self._process_task(task, worker_id),
-                            timeout=self.task_timeout_seconds
-                        )
+                        # Register active task for monitoring
+                        self._active_tasks[worker_id] = {
+                            'start_time': start_time,
+                            'task_type': task.task_type.value,
+                            'chat_id': task.chat_id,
+                            'message_id': task.message_id,
+                            'media_type': task.media_type,
+                            'description': f"{task.media_type} from Chat {task.chat_id} (Msg {task.message_id})"
+                        }
+                        
+                        try:
+                            # Add timeout protection to prevent stuck workers
+                            await asyncio.wait_for(
+                                self._process_task(task, worker_id),
+                                timeout=self.task_timeout_seconds
+                            )
+                        finally:
+                            # Clear active task
+                            if worker_id in self._active_tasks:
+                                del self._active_tasks[worker_id]
                         
                         # Record processing duration for per-chat throttling
                         duration = time.time() - start_time
@@ -762,6 +788,59 @@ class ProcessingQueue:
             except Exception as e:
                 logger.error(f"Heartbeat monitor error: {e}")
                 await asyncio.sleep(60)
+
+    async def _monitor_queue_status(self):
+        """
+        Periodically logs detailed queue status and stuck tasks.
+        Provides visibility into what is clogging the queue.
+        """
+        while self._running:
+            try:
+                # 1. Get Queue Sizes
+                main_len = 0
+                dlq_len = 0
+                if self.redis_available:
+                    try:
+                        main_len = self.redis_client.llen(self.queue_key)
+                        dlq_len = self.redis_client.llen(self.dead_letter_key)
+                    except:
+                        pass
+                
+                # 2. Check Active Tasks (Stuck?)
+                now = time.time()
+                active_count = len(self._active_tasks)
+                stuck_log = []
+                
+                for worker_id, info in self._active_tasks.items():
+                    duration = now - info['start_time']
+                    if duration > 60:  # If taking longer than 60s
+                        stuck_log.append(f"  ⚠️ Worker {worker_id}: {duration:.1f}s on {info['description']}")
+                
+                # 3. Calculate Rate (approx)
+                # We could track processed_last_minute if we reset it, 
+                # but simplest is just to print current backlog
+                
+                log_msg = [
+                    f"📊 Queue Status: {main_len} pending, {dlq_len} failed.",
+                    f"   Active Workers: {active_count}/{self.num_workers}"
+                ]
+                
+                if stuck_log:
+                    log_msg.append("   ⚠️ Stuck/Long Running Tasks:")
+                    log_msg.extend(stuck_log)
+                elif active_count > 0:
+                    # Log what they are doing briefly
+                    tasks = [f"W{wid}:{info['media_type']}" for wid, info in self._active_tasks.items()]
+                    log_msg.append(f"   Working on: {', '.join(tasks)}")
+                
+                logger.info("\n".join(log_msg))
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Queue monitor error: {e}")
+            
+            await asyncio.sleep(60)  # Log every minute
 
     def _try_reconnect_redis(self):
         """Attempts to reconnect to Redis if connection was lost."""
