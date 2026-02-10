@@ -177,6 +177,26 @@ class IdentityMatcher:
     ) -> int:
         """Creates a new identity with a topic and stores the initial embedding."""
         try:
+            # Double-check inside a transaction/critical section to avoid race conditions
+            # (Worker A and B both see no match, both try to create)
+            # A robust way is to re-query with a stricter threshold or just rely on the fact that
+            # slight duplicates are merged later? Merging is hard.
+            # Let's try to find match again just in case another worker finished 1ms ago.
+            
+            # Re-check for match (quick check)
+            match = await self._find_similar_embedding(embedding)
+            if match:
+                 logger.info(f"Race condition avoided: Found match {match['topic_id']} just before creation")
+                 await self._store_embedding(
+                    embedding=embedding,
+                    topic_id=match['topic_id'],
+                    quality_score=quality_score,
+                    source_chat_id=source_chat_id,
+                    source_message_id=source_message_id,
+                    frame_index=frame_index
+                 )
+                 return match['topic_id']
+
             # Create topic using Phase 2 TopicManager
             if self.topic_manager:
                 topic_result = await self.topic_manager.create_topic()
