@@ -449,7 +449,7 @@ class MainWorker:
         try:
             async with get_db_connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("SELECT 1")
+                    await asyncio.wait_for(cur.execute("SELECT 1"), timeout=5.0)
             checks['Database'] = '✅ Connected'
         except Exception as e:
             checks['Database'] = f'❌ Error: {str(e)[:50]}'

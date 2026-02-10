@@ -266,7 +266,7 @@ class ProcessingQueue:
             # Use in-memory fallback
             await self.fallback_queue.put(json.dumps(task_data))
         
-        self._check_backpressure()
+        self.check_backpressure()
         logger.debug(f"Enqueued {media_type} from chat {chat_id}, msg {message_id}")
     
     async def enqueue_profile_photo(
@@ -305,11 +305,11 @@ class ProcessingQueue:
         else:
             await self.fallback_queue.put(json.dumps(task_data))
         
-        self._check_backpressure()
+        self.check_backpressure()
         logger.debug(f"Enqueued profile photo for user {user_id}")
     
     
-    def _check_backpressure(self):
+    def check_backpressure(self):
         """Checks queue size and updates backpressure state."""
         queue_size = 0
         
@@ -344,6 +344,11 @@ class ProcessingQueue:
         if old_state != self._backpressure_state:
             logger.info(f"Backpressure state: {old_state.value} → {self._backpressure_state.value} (queue: {queue_size})")
             self._notify_backpressure_change()
+            
+    def _check_backpressure(self):
+        """Compatibility wrapper for check_backpressure."""
+        return self.check_backpressure()
+
             
     def _notify_backpressure_change(self):
         """Notifies registered callbacks of backpressure state change."""

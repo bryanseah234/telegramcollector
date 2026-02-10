@@ -201,6 +201,11 @@ class MessageScanner:
                 # If queue is full (CRITICAL), pause scanning to prevent Redis overload
                 while self.processing_queue.should_pause():
                     logger.warning(f"Combined Queue limit reached. Pausing scan for chat {chat_id} (backpressure)...")
+                    # Force a check to update the state, otherwise we might be stuck here forever if nothing else updates it
+                    self.processing_queue.check_backpressure()
+                    if not self.processing_queue.should_pause():
+                        logger.info("Combined Queue limit dropped below critical. Resuming scan...")
+                        break
                     await asyncio.sleep(5)  # Wait 5s before checking again
             
             # Final checkpoint update

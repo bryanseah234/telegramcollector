@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     MIN_QUALITY_THRESHOLD: float = 0.67  # Stricter quality check (was 0.5)
     MAX_MEDIA_SIZE_MB: int = 50
     NUM_WORKERS: int = 4
-    QUEUE_MAX_SIZE: int = 2000  # Backpressure limit (items) - increases with RAM
+    QUEUE_MAX_SIZE: int = 4000  # Backpressure limit (items) - increases with RAM
     USE_GPU: bool = False
     
     # Operational

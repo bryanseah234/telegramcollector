@@ -91,7 +91,7 @@ class DatabaseManager:
                 # Test a connection
                 try:
                     async with self.pool.connection() as conn:
-                        await conn.execute("SELECT 1")
+                        await asyncio.wait_for(conn.execute("SELECT 1"), timeout=5.0)
                     logger.debug("Pool health check passed")
                 except Exception as e:
                     logger.warning(f"Pool health check failed: {e}. Attempting recovery...")
