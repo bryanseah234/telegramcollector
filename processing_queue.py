@@ -565,14 +565,34 @@ class ProcessingQueue:
                     
                     self.stats['processed'] += 1
                 except asyncio.TimeoutError:
-                    from observability import record_error
-                    record_error("TimeoutError")
-                    logger.error(f"Worker {worker_id}: Task timed out after {self.task_timeout_seconds}s (Chat {task.chat_id})")
-                    self.stats['errors'] += 1
-                    # Include timeout specific metadata
-                    task_data['_failure_reason'] = "timeout"
-                    await self._move_to_dead_letter(task_data, "Task execution timed out")
+                    logger.critical(f"Worker {worker_id} timed out processing task! This indicates a stuck thread (e.g. CUDA).")
+                    logger.critical("❌ FORCING CONTAINER RESTART (sys.exit(1)) TO CLEAR STUCK STATE.")
+                    import sys
+                    sys.exit(1)
+
+                except asyncio.CancelledError:
+                    break
+
                 except Exception as e:
+                    # Check for FloodWaitError dynamically to avoid import issues
+                    if type(e).__name__ == 'FloodWaitError':
+                        if e.seconds > 300:
+                            logger.warning(f"Long FloodWait ({e.seconds}s) detected. Requeueing task to BACK of queue.")
+                            if self.redis_available:
+                                try:
+                                    await loop.run_in_executor(None, self.redis_client.rpush, self.queue_key, json.dumps(task_data))
+                                except:
+                                    await self.fallback_queue.put(json.dumps(task_data))
+                            else:
+                                await self.fallback_queue.put(json.dumps(task_data))
+                            continue
+                        else:
+                            # Short wait, carry on to general error handling (or ignore if handled?)
+                            # Actually, uploader raises it, so we must handle it. 
+                            # If short (<300), we treat as normal error (retry logic below will handle it)
+                            pass
+
+                    # General Error Handling (includes short FloodWait)
                     logger.error(f"Worker {worker_id} error processing task: {e} (Chat {task.chat_id})")
                     self.stats['errors'] += 1
                     
@@ -598,9 +618,7 @@ class ProcessingQueue:
                     else:
                         logger.error(f"Task failed after {self.max_task_retries} retries. Moving to DLQ.")
                         await self._move_to_dead_letter(task_data, str(e))
-                    
-            except asyncio.CancelledError:
-                break
+
             except Exception as e:
                 consecutive_errors += 1
                 delay = min(30, 1.5 ** consecutive_errors)  # Exponential backoff up to 30s

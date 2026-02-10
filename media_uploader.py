@@ -203,6 +203,9 @@ class MediaUploader:
                 
             except FloodWaitError as e:
                 wait_time = e.seconds + 1
+                if wait_time > 300:
+                    raise  # Re-raise to be caught by caller as "Long FloodWait"
+                    
                 logger.warning(f"FloodWait during upload. Waiting {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 # Don't count this as an attempt
