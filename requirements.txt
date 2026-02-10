@@ -13,10 +13,10 @@ insightface==0.7.3
 onnxruntime==1.17.1
 opencv-python-headless==4.9.0.80
 av>=13.0.0
-Pillow==10.2.0
+Pillow==10.3.0
 
 # Dashboard
-streamlit==1.32.0
+streamlit==1.37.0
 pandas==2.2.1
 altair==5.2.0
 
@@ -26,7 +26,7 @@ pytest-asyncio==0.23.5
 
 # Utilities
 watchdog==4.0.0
-requests==2.31.0
+requests==2.32.4
 aiofiles==23.2.1
 pydantic-settings==2.2.1
 psycopg-pool==3.2.1
