@@ -64,7 +64,8 @@ class BotClientManager:
         from telethon.errors import FloodWaitError
         
         # Create bot client
-        self._client = TelegramClient('bot_publisher', API_ID, API_HASH)
+        session_name = os.getenv('BOT_SESSION_NAME', 'bot_publisher')
+        self._client = TelegramClient(session_name, API_ID, API_HASH)
         
         try:
             await self._client.start(bot_token=BOT_TOKEN)
