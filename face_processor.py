@@ -67,15 +67,23 @@ class FaceProcessor:
                 self.min_quality = settings.MIN_QUALITY_THRESHOLD
                 
                 self._initialized = True
-                logger.info(f"InsightFace initialized. Providers: {self.providers}, Min quality: {self.min_quality}")
+                logger.info(f"InsightFace initialized successfully. Providers: {self.providers}")
                 return True
                 
             except Exception as e:
-                logger.error(f"FaceProcessor init failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                logger.error(f"FaceProcessor init failed with {self.providers} (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                
+                # FAILSAFE: If GPU fails, fallback to CPU immediately for next attempt
+                if 'CUDAExecutionProvider' in self.providers:
+                    logger.warning("⚠️ GPU initialization failed. Falling back to CPU...")
+                    self.providers = ['CPUExecutionProvider']
+                    # Don't wait, retry immediately with CPU
+                    continue
+                
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(1)
                 else:
-                    logger.error("FaceProcessor initialization failed after max retries")
+                    logger.critical("FaceProcessor initialization failed after max retries")
                     return False
         
         return False
