@@ -190,7 +190,8 @@ class ProcessingQueue:
         self.max_task_retries = 10
         
         # Task execution timeout (prevent stuck workers)
-        self.task_timeout_seconds = 300  # 5 minutes max per task
+        # Use dynamic setting with a safe default
+        self.task_timeout_seconds = int(get_dynamic_setting("WORKER_TASK_TIMEOUT", 300))
         
         # Worker memory limit (MB)
         # Worker memory limit (MB)
@@ -954,6 +955,9 @@ class ProcessingQueue:
             self.stats['errors'] += 1
             return
         
+        # Watchdog logging
+        logger.debug(f"Step 1/4: Extracting frames from {task.media_type}...")
+        
         # Step 1: Get frames
         if task.media_type in ('video', 'video_note'):
             is_round = task.media_type == 'video_note'
@@ -967,6 +971,7 @@ class ProcessingQueue:
             return
         
         # Step 2 & 3: Detect faces and match identities
+        logger.debug(f"Step 2/4: Detecting faces in {len(frames)} frames...")
         matched_topics = set()
         total_faces_detected = 0
         
@@ -999,7 +1004,6 @@ class ProcessingQueue:
                     logger.debug(f"  → Face skipped (quality={face['quality']:.2f}, below threshold?)")
         
         logger.info(f"👥 Total: {total_faces_detected} faces detected → {len(matched_topics)} unique topic(s)")
-        
         # Update stats for batched Hub notification
         if total_faces_detected > 0:
             await increment_stat('faces_detected', total_faces_detected)
@@ -1008,6 +1012,7 @@ class ProcessingQueue:
         
         # Step 4: Upload media to all matched topics
         if matched_topics and self.media_uploader:
+            logger.debug(f"Step 3/4: Uploading to {len(matched_topics)} topic(s)...")
             logger.info(f"📤 Uploading to {len(matched_topics)} topic(s) for msg {task.message_id}")
             task.content.seek(0)
             
@@ -1024,6 +1029,9 @@ class ProcessingQueue:
                 if result == 0:
                     logger.warning(f"⚠️ Upload to topic {topic_id} failed!")
                     upload_failures += 1
+                elif result == -1:
+                    logger.debug(f"⏭️ Media already in topic {topic_id}, skipping.")
+                
                 task.content.seek(0)  # Reset for next upload
 
             # CRITICAL: If any upload failed, fail the task so it goes to DLQ/Retry.
@@ -1035,6 +1043,7 @@ class ProcessingQueue:
             logger.debug(f"No faces matched for {task.media_type} msg {task.message_id}")
         
         # Step 5: Mark file as processed for deduplication
+        logger.debug("Step 4/4: Marking file as processed...")
         if task.file_unique_id:
             await self._mark_file_processed(
                 file_unique_id=task.file_unique_id,

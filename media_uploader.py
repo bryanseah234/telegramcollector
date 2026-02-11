@@ -100,7 +100,7 @@ class MediaUploader:
         # Check for duplicate
         if await self._is_duplicate(source_message_id, source_chat_id, db_topic_id):
             logger.info(f"⏭️ Skipping duplicate upload: msg {source_message_id} from chat {source_chat_id} to topic {db_topic_id}")
-            return 0
+            return -1  # Return special code for duplicate/skip
         
         # Get topic info
         topic_info = await self.topic_manager.get_topic_info(db_topic_id)
