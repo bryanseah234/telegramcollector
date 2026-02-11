@@ -103,6 +103,21 @@ class MainWorker:
         await self.hub_notifier.start()
         logger.info("✓ Hub notifier started")
 
+        # Phase 5: Health Checker with Self-Healing
+        from health_checker import HealthChecker
+        self.health_checker = HealthChecker(
+            face_processor=self.face_processor,
+            processing_queue=self.processing_queue,
+            check_interval=settings.HEALTH_CHECK_INTERVAL
+        )
+        
+        # Register recovery actions
+        self.health_checker.register_recovery('telegram', self._recover_telegram)
+        self.health_checker.register_recovery('hub_access', self._recover_hub_access)
+        
+        await self.health_checker.start()
+        logger.info("✓ Health checker started with self-healing enabled")
+
         # Phase 2: Load User Accounts (Multiple)
         from telegram_client import TelegramClientManager
         from media_downloader import MediaDownloadManager
@@ -605,6 +620,38 @@ class MainWorker:
                 logger.info(f"Health check report sent to Hub Group")
         except Exception as e:
             logger.error(f"Failed to send health check report: {e}")
+
+        # SELF HEALING: Check HubNotifier
+        try:
+            if hasattr(self, 'hub_notifier'):
+                if not self.hub_notifier._running or (self.hub_notifier._flush_task and self.hub_notifier._flush_task.done()):
+                    logger.warning("⚠️ Hub Notifier stopped unexpectedly. Restarting...")
+                    await self.hub_notifier.stop() # Ensure clean
+                    self.hub_notifier = HubNotifier.get_instance() # Should get same or new
+                    # If instance was reset externally, this gets new. 
+                    # If same instance, we just call start().
+                    # But wait, if instance is same, start() checks _running.
+                    # We set _running=False in stop().
+                    await self.hub_notifier.start()
+                    logger.info("✅ Hub Notifier self-healed")
+        except Exception as e:
+            logger.error(f"Failed to self-heal HubNotifier: {e}")
+
+    async def _recover_telegram(self):
+        """Attempts to recover Telegram connections."""
+        logger.warning("Recovery: Checking Telegram clients...")
+        for account_id, manager in self.clients.items():
+            if not manager.client.is_connected():
+                logger.info(f"Reconnecting account {account_id}...")
+                await manager.start()
+    
+    async def _recover_hub_access(self):
+        """Attempts to recover Hub access."""
+        logger.warning("Recovery: Checking Bot client...")
+        from bot_client import bot_client_manager
+        if not bot_client_manager.client or not bot_client_manager.client.is_connected():
+            logger.info("Reconnecting bot client...")
+            await bot_client_manager.start()
     
     async def shutdown(self):
         """Gracefully shuts down all components."""
@@ -631,6 +678,14 @@ class MainWorker:
         
         from database import db_manager
         await db_manager.close()
+
+        # Stop Bot Client
+        try:
+            from bot_client import bot_client_manager
+            if bot_client_manager.is_ready():
+                await bot_client_manager.disconnect()
+        except Exception as e:
+            logger.warning(f"Failed to disconnect bot client: {e}")
         
         logger.info("Shutdown complete")
 
@@ -660,6 +715,14 @@ def main():
         
         try:
             mode = settings.RUN_MODE  # 'backfill', 'realtime', or 'both'
+            
+            # Reset HubNotifier singleton to ensure fresh event loop connection
+            try:
+                from hub_notifier import HubNotifier
+                HubNotifier.reset_instance()
+            except Exception as e:
+                logger.warning(f"Failed to reset HubNotifier: {e}")
+                
             logger.info(f"Starting worker (attempt {restart_count + 1}/{MAX_RESTART_ATTEMPTS})")
             loop.run_until_complete(worker.run(mode))
             
@@ -704,6 +767,14 @@ def main():
                 
         finally:
             try:
+                # Reset singletons to prevent stale loop references
+                from hub_notifier import HubNotifier
+                from face_processor import FaceProcessor
+                from bot_client import bot_client_manager
+                
+                HubNotifier.reset_instance()
+                FaceProcessor.reset_instance()
+                
                 loop.close()
             except Exception:
                 pass

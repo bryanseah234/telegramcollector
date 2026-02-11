@@ -41,6 +41,7 @@ class HealthChecker:
         
         self._running = False
         self._task = None
+        self._recovery_actions = {} # check_name -> async callback
     
     async def start(self):
         """Starts periodic health checks."""
@@ -70,6 +71,11 @@ class HealthChecker:
             except Exception as e:
                 logger.error(f"Health check loop error: {e}")
                 await asyncio.sleep(60)  # Wait before retrying
+    
+    def register_recovery(self, check_name: str, callback):
+        """Registers a callback to be executed if a check fails."""
+        self._recovery_actions[check_name] = callback
+        logger.info(f"Registered recovery action for: {check_name}")
     
     async def run_checks(self) -> Dict[str, Any]:
         """
@@ -127,6 +133,10 @@ class HealthChecker:
         # Calculate response time
         response_time_ms = int((time.time() - start_time) * 1000)
         
+        # 6. Execute Recovery Actions
+        if errors:
+            await self._run_recovery(results)
+
         # Store results
         await self._store_results(results, response_time_ms)
         
@@ -139,6 +149,19 @@ class HealthChecker:
         logger.info(f"Health check {status} (response: {response_time_ms}ms, queue: {results['queue_size']})")
         
         return results
+
+    async def _run_recovery(self, results: Dict[str, Any]):
+        """Attempts to run recovery actions for failed checks."""
+        for check_name, ok in results.items():
+            if check_name.endswith('_ok') and not ok:
+                name = check_name.replace('_ok', '')
+                if name in self._recovery_actions:
+                    logger.warning(f"Attempting recovery for {name}...")
+                    try:
+                        await self._recovery_actions[name]()
+                        logger.info(f"Recovery attempt for {name} completed")
+                    except Exception as e:
+                        logger.error(f"Recovery action for {name} failed: {e}")
     
     async def _check_database(self) -> bool:
         """Tests database connectivity."""

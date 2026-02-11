@@ -11,6 +11,8 @@ Uses batching to prevent flooding the Hub with individual messages.
 """
 import logging
 import asyncio
+import sqlite3
+import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from enum import Enum
@@ -95,6 +97,26 @@ class HubNotifier:
         logger.info(f"HubNotifier initialized (batch_interval={batch_interval}s, rate_limit={rate_limit_per_minute}/min)")
     
     @classmethod
+    def reset_instance(cls):
+        """Resets the singleton instance (e.g. on restart)."""
+        if cls._instance:
+            # Try to stop existing instance if running
+            try:
+                # Use get_event_loop as we might be in a crash state
+                # but careful not to raise if no loop
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                    
+                if loop.is_running():
+                    loop.create_task(cls._instance.stop())
+            except Exception:
+                pass
+            cls._instance = None
+            logger.info("HubNotifier instance reset")
+
+    @classmethod
     def get_instance(cls) -> 'HubNotifier':
         """Gets or creates singleton instance."""
         if cls._instance is None:
@@ -107,18 +129,50 @@ class HubNotifier:
         return cls._instance
     
     async def start(self):
-        """Starts the background flusher."""
+        """Starts the background flusher and its supervisor."""
         if self._running:
             return
         
         self._running = True
-        self._flush_task = asyncio.create_task(self._background_flusher())
-        logger.info("HubNotifier background flusher started")
+        self._supervisor_task = asyncio.create_task(self._supervisor_loop())
+        # Re-create lock on start to ensure it belongs to current loop
+        self._lock = asyncio.Lock()
+        logger.info("HubNotifier background flusher and supervisor started")
     
+    async def _supervisor_loop(self):
+        """Monitors the flusher task and restarts it if it dies."""
+        while self._running:
+            try:
+                if self._flush_task is None or self._flush_task.done():
+                    if self._flush_task and self._flush_task.done():
+                        try:
+                            # Check if it failed with an exception
+                            if exc := self._flush_task.exception():
+                                logger.error(f"Flusher task died unexpectedly: {exc}")
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+                        
+                    logger.info("Starting/Restarting background flusher...")
+                    self._flush_task = asyncio.create_task(self._background_flusher())
+                
+                await asyncio.sleep(10)  # Check every 10s
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Supervisor loop error: {e}")
+                await asyncio.sleep(60)
+
     async def stop(self):
         """Stops the background flusher and flushes remaining events."""
         self._running = False
         
+        if hasattr(self, '_supervisor_task') and self._supervisor_task:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
+
         if self._flush_task:
             self._flush_task.cancel()
             try:
@@ -126,8 +180,14 @@ class HubNotifier:
             except asyncio.CancelledError:
                 pass
         
-        # Final flush
-        await self.flush()
+        # Final flush - attempt only if loop is still running
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                await self.flush()
+        except RuntimeError:
+            logger.warning("Could not perform final flush: no running event loop")
+            
         logger.info("HubNotifier stopped")
     
     async def queue_event(
@@ -171,6 +231,8 @@ class HubNotifier:
     
     async def _background_flusher(self):
         """Periodically flushes queued events."""
+        logger.debug("HubNotifier background flusher loop started")
+        
         while self._running:
             try:
                 await asyncio.sleep(self._batch_interval)
@@ -180,10 +242,15 @@ class HubNotifier:
                 
                 # Then flush new ones
                 await self.flush()
+                
             except asyncio.CancelledError:
+                logger.debug("HubNotifier flusher cancelled")
                 break
             except Exception as e:
-                logger.error(f"Background flusher error: {e}")
+                import traceback
+                logger.error(f"Background flusher error: {e}\n{traceback.format_exc()}")
+                # Prevent tight loop if error persists
+                await asyncio.sleep(5)
     
     async def flush(self):
         """Sends all queued events as a batched summary."""
@@ -290,7 +357,7 @@ class HubNotifier:
         db_path = "hub_cache.db"
         try:
             # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._write_to_cache, db_path, message)
             logger.info("Cached notification locally due to Hub failure")
         except Exception as e:
@@ -315,7 +382,7 @@ class HubNotifier:
             return
             
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             messages = await loop.run_in_executor(None, self._read_cache, db_path)
             
             if not messages:

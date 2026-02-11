@@ -26,6 +26,8 @@ class TestHubNotifier:
             rate_limit_per_minute=10,
             enable_notifications=True
         )
+        # Mock supervisor loop to prevent actual background tasks during tests
+        notifier._supervisor_loop = AsyncMock()
         return notifier
     
     @pytest.mark.asyncio

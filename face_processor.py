@@ -89,6 +89,13 @@ class FaceProcessor:
         return False
     
     @classmethod
+    def reset_instance(cls):
+        """Resets the singleton instance."""
+        if cls._instance:
+            cls._instance = None
+            logger.info("FaceProcessor instance reset")
+
+    @classmethod
     def get_instance(cls) -> 'FaceProcessor':
         """Gets or creates singleton instance."""
         if cls._instance is None:
@@ -114,7 +121,7 @@ class FaceProcessor:
         
         try:
             # Run detection in thread pool (CPU-bound operation)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             faces = await loop.run_in_executor(
                 self._executor, 
                 self._detect_faces_sync, 
