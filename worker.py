@@ -50,6 +50,7 @@ class MainWorker:
         # Phase 2: Bot Client (for topics and publishing)
         from bot_client import bot_client_manager
         await bot_client_manager.start()
+        bot_client_manager.register_worker(self)
         logger.info("✓ Bot client connected (for topic management)")
         
         # Phase 2: Topic Manager (uses bot client)

@@ -155,7 +155,19 @@ class ProcessingQueue:
         self.high_watermark = high_watermark
         self.low_watermark = low_watermark
         self._backpressure_state = BackpressureState.NORMAL
+        self._backpressure_state = BackpressureState.NORMAL
         self._backpressure_callbacks: list = []
+        
+        # Manual pause state
+        self.manual_pause = False
+        if self.redis_available:
+            try:
+                # Check if system is paused in Redis
+                self.manual_pause = self.redis_client.get("system_paused") == b'true'
+                if self.manual_pause:
+                    logger.warning("System is manually PAUSED (loaded from Redis)")
+            except Exception as e:
+                logger.error(f"Failed to load pause state from Redis: {e}")
         
         # Adaptive backpressure tracking
         self._per_chat_times: Dict[int, float] = {}  # chat_id -> avg processing time
@@ -383,7 +395,14 @@ class ProcessingQueue:
     
     def should_pause(self) -> bool:
         """Returns True if scanners should pause completely."""
-        return self._backpressure_state == BackpressureState.CRITICAL
+        return self.manual_pause or self._backpressure_state == BackpressureState.CRITICAL
+    
+    def set_manual_pause(self, paused: bool):
+        """Sets manual pause state."""
+        self.manual_pause = paused
+        logger.info(f"Manual pause set to: {paused}")
+        # Trigger backpressure update/notify
+        self.check_backpressure()
     
     def get_adaptive_delay(self) -> float:
         """

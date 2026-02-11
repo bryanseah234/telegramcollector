@@ -98,6 +98,36 @@ class BotClientManager:
         """Returns True if the bot client is connected and ready."""
         return self._initialized and self._client and self._client.is_connected()
 
+    def register_worker(self, worker_instance):
+        """Registers the main worker instance to handle commands."""
+        if not self._client:
+            logger.error("Cannot register worker: Bot client not initialized")
+            return
+
+        # Avoid circular imports
+        import bot_commands
+        from telethon import events
+
+        logger.info("Registering bot command handlers...")
+
+        @self._client.on(events.NewMessage(pattern='/status'))
+        async def status_handler(event):
+            await bot_commands.handle_status(event, worker_instance)
+
+        @self._client.on(events.NewMessage(pattern='/pause'))
+        async def pause_handler(event):
+            await bot_commands.handle_pause(event, worker_instance)
+
+        @self._client.on(events.NewMessage(pattern='/resume'))
+        async def resume_handler(event):
+            await bot_commands.handle_resume(event, worker_instance)
+
+        @self._client.on(events.NewMessage(pattern='/restart'))
+        async def restart_handler(event):
+            await bot_commands.handle_restart(event, worker_instance)
+            
+        logger.info("Bot commands registered successfully")
+
 
 # Global singleton instance
 bot_client_manager = BotClientManager()
