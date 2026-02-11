@@ -654,40 +654,99 @@ class MainWorker:
             await bot_client_manager.start()
     
     async def shutdown(self):
-        """Gracefully shuts down all components."""
-        logger.info("Shutting down...")
+        """Gracefully shuts down all components and cleans up tasks."""
+        logger.info("Graceful shutdown initiated...")
         
-        # Send shutdown notification
+        # 1. Send shutdown notification (before services stop)
         await self._send_shutdown_notification()
         
-        # Stop hub notifier (flushes pending events)
-        if hasattr(self, 'hub_notifier'):
-            await self.hub_notifier.stop()
-        
-        # Stop processing queue
-        if self.processing_queue:
-            # stats = self.processing_queue.get_stats()
-            # logger.info(f"Final stats: {stats}")
-            # await self.processing_queue.stop()
-            pass
-        
-        # Disconnect all Telegram clients
-        for account_id, manager in self.clients.items():
-            await manager.stop()
-            logger.info(f"Disconnected account {account_id}")
-        
-        from database import db_manager
-        await db_manager.close()
+        # 2. Stop Scanners (to stop receiving new events)
+        for account_id, (scanner, rt_scanner) in self.scanners.items():
+            try:
+                await rt_scanner.stop()
+                logger.info(f"Stopped realtime scanner for account {account_id}")
+            except Exception as e:
+                logger.debug(f"Error stopping scanner: {e}")
 
-        # Stop Bot Client
+        # 3. Stop hub notifier (flushes pending events)
+        if hasattr(self, 'hub_notifier'):
+            try:
+                await self.hub_notifier.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping hub notifier: {e}")
+        
+        # 4. Stop health checker
+        if hasattr(self, 'health_checker'):
+            try:
+                await self.health_checker.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping health checker: {e}")
+
+        # 5. Stop processing queue
+        if self.processing_queue:
+            try:
+                await self.processing_queue.stop()
+                logger.info("Stopped processing queue")
+            except Exception as e:
+                logger.debug(f"Error stopping queue: {e}")
+        
+        # 6. Disconnect all Telegram clients
+        for account_id, manager in self.clients.items():
+            try:
+                await manager.stop()
+                logger.info(f"Disconnected account {account_id}")
+            except Exception as e:
+                logger.debug(f"Error disconnecting account {account_id}: {e}")
+        
+        # 7. Disconnect Bot Client
         try:
             from bot_client import bot_client_manager
             if bot_client_manager.is_ready():
                 await bot_client_manager.disconnect()
+                logger.info("Disconnected bot client")
         except Exception as e:
-            logger.warning(f"Failed to disconnect bot client: {e}")
+            logger.debug(f"Failed to disconnect bot client: {e}")
+
+        # 8. Close Database
+        try:
+            from database import db_manager
+            await db_manager.close()
+            logger.info("Closed database connections")
+        except Exception as e:
+            logger.debug(f"Error closing database: {e}")
+        
+        # 9. Final Task Cleanup (The most critical part for "Event loop is closed" errors)
+        await self._cancel_all_tasks()
         
         logger.info("Shutdown complete")
+
+    async def _cancel_all_tasks(self):
+        """Cancels all remaining background tasks on the current loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        current_task = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not current_task]
+        
+        if not tasks:
+            return
+
+        logger.info(f"Cancelling {len(tasks)} remaining background tasks...")
+        for task in tasks:
+            task.cancel()
+
+        # Wait for all tasks to acknowledge cancellation (with timeout)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for tasks to cancel")
+        except Exception as e:
+            logger.debug(f"Error during final task cleanup: {e}")
 
 
 def main():
@@ -767,7 +826,11 @@ def main():
                 
         finally:
             try:
-                # Reset singletons to prevent stale loop references
+                # 1. Ensure worker is shut down if it hasn't been
+                if worker._running:
+                    loop.run_until_complete(worker.shutdown())
+                
+                # 2. Reset singletons to prevent stale loop references
                 from hub_notifier import HubNotifier
                 from face_processor import FaceProcessor
                 from bot_client import bot_client_manager
@@ -775,9 +838,14 @@ def main():
                 HubNotifier.reset_instance()
                 FaceProcessor.reset_instance()
                 
+                # 3. Final loop drain to let library tasks (like Telethon loops) finish
+                tasks = asyncio.all_tasks(loop)
+                if tasks:
+                    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                
                 loop.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Final cleanup error: {e}")
     
     logger.info("Worker process exiting")
 
