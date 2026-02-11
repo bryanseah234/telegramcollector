@@ -100,7 +100,16 @@ class DatabaseManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # Break loop if event loop is closed to prevent infinite log spam
+                if "no running event loop" in str(e) or isinstance(e, RuntimeError):
+                    logger.error("Pool health monitor stopping: no running event loop")
+                    break
                 logger.error(f"Pool health monitor error: {e}")
+                # Wait before retrying to verify it's not a tight loop
+                try:
+                    await asyncio.sleep(5)
+                except:
+                    break
     
     async def _recover_pool(self):
         """Attempts to recover the connection pool by resizing or recreating."""

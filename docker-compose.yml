@@ -56,9 +56,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 4G
         reservations:
-          memory: 256M
+          memory: 1G
     logging:
       driver: "json-file"
       options:
@@ -111,7 +111,7 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; r = redis.Redis(host='redis'); r.ping()"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/metrics || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

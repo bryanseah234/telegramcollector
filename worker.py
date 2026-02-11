@@ -13,6 +13,7 @@ import signal
 from typing import Dict, List
 from config import settings
 from hub_notifier import HubNotifier
+from observability import start_metrics_server
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +37,9 @@ class MainWorker:
     async def initialize(self):
         """Initializes all components in proper order."""
         logger.info("Initializing application components...")
+        
+        # Start metrics server early for health checks
+        start_metrics_server(8000)
         
         # Phase 1: Database
         from database import init_db, db_manager, get_db_connection
