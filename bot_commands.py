@@ -100,6 +100,26 @@ async def handle_restart(event, worker):
         logger.error(f"Restart command failed: {e}")
         await event.reply(f"❌ Error: {str(e)}")
 
+async def handle_help(event, worker):
+    """Handles /help or /commands command."""
+    try:
+        if not await _is_admin(event, worker):
+            return
+
+        help_text = (
+            "🤖 **Telegram Archiver Bot - Commands**\n\n"
+            "🔍 `/status` - Check system health and queue depth.\n"
+            "⏸️ `/pause` - Suspend message scanning (queue continues).\n"
+            "▶️ `/resume` - Resume scanning and processing.\n"
+            "🔄 `/restart` - Safely restart the application via Docker.\n"
+            "❓ `/commands` - Show this help menu."
+        )
+        await event.reply(help_text)
+        
+    except Exception as e:
+        logger.error(f"Help command failed: {e}")
+        await event.reply(f"❌ Error: {str(e)}")
+
 async def _is_admin(event, worker) -> bool:
     """Verifies if the sender is an admin in the Hub Group."""
     try:

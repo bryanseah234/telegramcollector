@@ -125,6 +125,10 @@ class BotClientManager:
         @self._client.on(events.NewMessage(pattern='/restart'))
         async def restart_handler(event):
             await bot_commands.handle_restart(event, worker_instance)
+        
+        @self._client.on(events.NewMessage(pattern=r'^/(commands|help)'))
+        async def help_handler(event):
+            await bot_commands.handle_help(event, worker_instance)
             
         logger.info("Bot commands registered successfully")
 
