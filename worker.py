@@ -33,9 +33,11 @@ class MainWorker:
         self.clients: Dict[int, 'TelegramClientManager'] = {}  # account_id -> client_manager
         self.processing_queue = None
         self._shutdown_event = asyncio.Event()
-    
+        self._running = False
+
     async def initialize(self):
         """Initializes all components in proper order."""
+        self._running = True
         logger.info("Initializing application components...")
         
         # Start metrics server early for health checks
@@ -655,6 +657,7 @@ class MainWorker:
     
     async def shutdown(self):
         """Gracefully shuts down all components and cleans up tasks."""
+        self._running = False
         logger.info("Graceful shutdown initiated...")
         
         # 1. Send shutdown notification (before services stop)
@@ -827,16 +830,17 @@ def main():
         finally:
             try:
                 # 1. Ensure worker is shut down if it hasn't been
-                if worker._running:
+                if 'worker' in locals() and worker._running:
                     loop.run_until_complete(worker.shutdown())
                 
                 # 2. Reset singletons to prevent stale loop references
                 from hub_notifier import HubNotifier
                 from face_processor import FaceProcessor
-                from bot_client import bot_client_manager
+                from bot_client import bot_client_manager, BotClientManager
                 
                 HubNotifier.reset_instance()
                 FaceProcessor.reset_instance()
+                BotClientManager.reset_instance()
                 
                 # 3. Final loop drain to let library tasks (like Telethon loops) finish
                 tasks = asyncio.all_tasks(loop)

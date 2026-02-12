@@ -42,6 +42,16 @@ class BotClientManager:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
+
+    @classmethod
+    def reset_instance(cls):
+        """Resets the singleton instance (used for restarts)."""
+        if cls._instance:
+            if cls._instance._client and cls._instance._client.is_connected():
+                # We can't await here (sync method), but we assume disconnect() was called
+                pass
+            cls._instance = None
+            logger.info("BotClientManager singleton reset")
     
     @property
     def client(self) -> TelegramClient:
