@@ -595,38 +595,27 @@ def render_identity_detail():
         if st.button("Merge", key="merge_btn", type="primary"):
             target_id = other_options[target]
             
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Move all embeddings to target
-                cursor.execute(
-                    "UPDATE face_embeddings SET topic_id = %s WHERE topic_id = %s",
-                    (target_id, identity_id)
-                )
-                
-                # Move all uploaded media to target
-                cursor.execute(
-                    "UPDATE uploaded_media SET topic_id = %s WHERE topic_id = %s",
-                    (target_id, identity_id)
-                )
-                
-                # Delete source identity
-                cursor.execute("DELETE FROM telegram_topics WHERE id = %s", (identity_id,))
-                
-                # Update target counts
-                cursor.execute("""
-                    UPDATE telegram_topics SET
-                        face_count = (SELECT COUNT(*) FROM face_embeddings WHERE topic_id = %s),
-                        message_count = (SELECT COUNT(*) FROM uploaded_media WHERE topic_id = %s)
-                    WHERE id = %s
-                """, (target_id, target_id, target_id))
-                
-                conn.commit()
+            from corrections import CorrectionHandler
+            import asyncio
             
-            st.success(f"Merged into {target}")
-            st.cache_data.clear()
-            st.session_state.page = "gallery"
-            st.rerun()
+            try:
+                handler = CorrectionHandler()
+                # Run the async merge function
+                success = asyncio.run(handler.merge_identities(identity_id, target_id))
+                
+                if success:
+                    st.success(f"Merged into {target}")
+                    st.cache_data.clear()
+                    st.session_state.page = "gallery"
+                    st.rerun()
+                else:
+                    st.error("Merge failed. Check logs for details.")
+            except Exception as e:
+                st.error(f"Merge error: {e}")
+            
+            # (Old manual SQL block removed)
+            
+            # (Old manual SQL block removed)
     else:
         st.info("No other identities available for merging.")
 

@@ -420,6 +420,11 @@ class MainWorker:
             
             # Start health check scheduler as background task
             health_task = asyncio.create_task(self._health_check_scheduler())
+
+            # Start update handler
+            from update_handler import setup_update_handler
+            self.update_handler = setup_update_handler(self.shutdown)
+            await self.update_handler.start()
             
             if mode in ('backfill', 'both'):
                 await self.run_backfill()
@@ -685,7 +690,14 @@ class MainWorker:
             except Exception as e:
                 logger.debug(f"Error stopping health checker: {e}")
 
-        # 5. Stop processing queue
+        # 5. Stop update handler
+        if hasattr(self, 'update_handler'):
+            try:
+                await self.update_handler.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping update handler: {e}")
+
+        # 6. Stop processing queue
         if self.processing_queue:
             try:
                 await self.processing_queue.stop()
@@ -693,7 +705,7 @@ class MainWorker:
             except Exception as e:
                 logger.debug(f"Error stopping queue: {e}")
         
-        # 6. Disconnect all Telegram clients
+        # 7. Disconnect all Telegram clients
         for account_id, manager in self.clients.items():
             try:
                 await manager.stop()
@@ -701,7 +713,7 @@ class MainWorker:
             except Exception as e:
                 logger.debug(f"Error disconnecting account {account_id}: {e}")
         
-        # 7. Disconnect Bot Client
+        # 8. Disconnect Bot Client
         try:
             from bot_client import bot_client_manager
             if bot_client_manager.is_ready():
@@ -710,7 +722,7 @@ class MainWorker:
         except Exception as e:
             logger.debug(f"Failed to disconnect bot client: {e}")
 
-        # 8. Close Database
+        # 9. Close Database
         try:
             from database import db_manager
             await db_manager.close()
@@ -718,7 +730,7 @@ class MainWorker:
         except Exception as e:
             logger.debug(f"Error closing database: {e}")
         
-        # 9. Final Task Cleanup (The most critical part for "Event loop is closed" errors)
+        # 10. Final Task Cleanup (The most critical part for "Event loop is closed" errors)
         await self._cancel_all_tasks()
         
         logger.info("Shutdown complete")

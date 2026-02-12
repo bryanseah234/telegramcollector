@@ -56,11 +56,15 @@ async def test_processing_queue_enqueue():
         # we rely on no exceptions + mock validation
         assert queue.get_queue_size() == 0 # Mock returns 0
 
-def test_backpressure_logic():
+@patch('processing_queue.get_dynamic_setting')
+def test_backpressure_logic(mock_get_setting):
     """Test backpressure state transitions."""
+    # Ensure get_dynamic_setting returns the default value passed to it
+    # This ignores the static QUEUE_MAX_SIZE=4000 in settings
+    mock_get_setting.side_effect = lambda key, default: default
+    
     mock_redis = MagicMock()
     mock_redis.ping.return_value = True
-    # ensure dynamic settings uses default (None -> default)
     mock_redis.get.return_value = None 
     
     with patch('redis.Redis', return_value=mock_redis):

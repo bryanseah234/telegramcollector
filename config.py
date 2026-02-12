@@ -83,57 +83,63 @@ except Exception as e:
     # ... error handling ...
     sys.exit(1)
 
-try:
-    import redis
-except ImportError:
-    redis = None
+# Global Redis client for dynamic settings
+_redis_config_client = None
 
-def get_dynamic_setting(key: str, default: Any) -> Any:
+def _get_redis_client():
+    """Returns a cached Redis client for config lookups."""
+    global _redis_config_client
+    if _redis_config_client is None:
+        try:
+            import redis
+            _redis_config_client = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD,
+                decode_responses=True,
+                socket_timeout=1,
+                socket_connect_timeout=1
+            )
+        except ImportError:
+            pass
+    return _redis_config_client
+
+def get_dynamic_setting(key: str, default: Any = None) -> Any:
     """
-    Fetches a setting with priority: Redis > Env/Config
+    Fetches a setting from Redis (dynamic) or falls back to env/default.
+    Uses a cached Redis connection to check for overrides.
     """
-    if redis is None:
-        return default
-        
+    # 1. Check Redis for override
     try:
-        # Use a separate client or reuse one if possible, but for config
-        # a new short-lived connection is safer to avoid circular imports of existing clients
-        r = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB,
-            password=settings.REDIS_PASSWORD,
-            decode_responses=True,
-            socket_connect_timeout=1
-        )
-        val = r.get(f"config:{key}")
-        if val is not None:
-            # Convert type based on default
-            if isinstance(default, bool):
-                return val.lower() == "true"
-            if isinstance(default, int):
-                return int(val)
-            if isinstance(default, float):
-                return float(val)
-            return val
+        redis_client = _get_redis_client()
+        if redis_client:
+            redis_key = f"config:{key}"
+            value = redis_client.get(redis_key)
+            if value is not None:
+                # Attempt type conversion if default is provided
+                if default is not None:
+                    if isinstance(default, bool):
+                        return str(value).lower() == 'true'
+                    if isinstance(default, int):
+                        return int(value)
+                    if isinstance(default, float):
+                        return float(value)
+                return value
     except Exception:
-        pass
-    return default
+        pass  # Fallback to static setting
+        
+    # 2. Return Static/Env Value
+    return getattr(settings, key, default)
 
 def set_dynamic_setting(key: str, value: Any):
     """Sets a dynamic setting in Redis."""
-    if redis is None:
-        print("Redis not installed, cannot set dynamic setting")
-        return
-
     try:
-        r = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB,
-            password=settings.REDIS_PASSWORD,
-            decode_responses=True
-        )
-        r.set(f"config:{key}", str(value))
-    except Exception as e:
-        print(f"Failed to set dynamic setting: {e}")
+        redis_client = _get_redis_client()
+        if redis_client:
+            redis_key = f"config:{key}"
+            redis_client.set(redis_key, str(value))
+            return True
+    except Exception:
+        return False
+    return False

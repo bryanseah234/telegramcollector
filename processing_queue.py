@@ -342,10 +342,10 @@ class ProcessingQueue:
                 queue_size = self.redis_client.llen(self.queue_key)
                 # Success - update last known size
                 self._last_known_redis_size = queue_size
-            except Exception:
+            except Exception as e:
+                logger.error(f"Redis check failed in backpressure: {e}")
                 self.redis_available = False
                 # Fallback: Use max of local fallback and last known Redis size
-                # This prevents releasing backpressure during transient Redis failures
                 queue_size = max(self.fallback_queue.qsize(), self._last_known_redis_size)
         else:
             # Fallback mode
@@ -354,8 +354,8 @@ class ProcessingQueue:
         old_state = self._backpressure_state
         
         # Get dynamic high watermark
-        dynamic_high = get_dynamic_setting("QUEUE_MAX_SIZE", self.high_watermark)
-        dynamic_low = int(dynamic_high * 0.2)  # Maintain ratio
+        dynamic_high = int(get_dynamic_setting("QUEUE_MAX_SIZE", self.high_watermark))
+        dynamic_low = int(get_dynamic_setting("QUEUE_MIN_SIZE", self.low_watermark))
         
         if queue_size >= dynamic_high:
             self._backpressure_state = BackpressureState.CRITICAL

@@ -52,6 +52,15 @@ class CorrectionHandler:
                     DELETE FROM telegram_topics WHERE id = %s
                 """, (source_topic_id,))
                 
+                # Update target counts (Ported from dashboard.py for consistency)
+                cursor.execute("""
+                    UPDATE telegram_topics SET
+                        face_count = (SELECT COUNT(*) FROM face_embeddings WHERE topic_id = %s),
+                        message_count = (SELECT COUNT(*) FROM uploaded_media WHERE topic_id = %s),
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (target_topic_id, target_topic_id, target_topic_id))
+
                 conn.commit()
                 
             # TODO: Optionally archive/delete the Telegram forum topic

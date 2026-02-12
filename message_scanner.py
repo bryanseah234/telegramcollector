@@ -539,48 +539,30 @@ class RealtimeScanner:
                 await asyncio.sleep(3600)
                 
                 logger.info("⏰ Running periodic contact scan...")
-                # We need an instance of MessageScanner to reuse scan_contacts?
-                # Or just re-implement simple logic here? 
-                # Re-implementing is cleaner to avoid circular deps or passing scanners around.
                 
                 contacts = await self.client.get_contacts()
-                count = 0
+                new_count = 0
+                
                 for user in contacts:
                     if isinstance(user, User) and user.photo:
-                        # We don't have easy access to _is_photo_processed (it's in MessageScanner)
-                        # But we can just queue it - deduplication happens in ProcessingQueue/DB anyway!
-                        # Downloading everything might be heavy though.
-                        # Let's check DB properly.
-                        
-                        # Re-use MessageScanner logic?
-                        # It's better if RealtimeScanner takes a reference to MessageScanner?
-                        # OR we just import the DB check
-                        pass
-                        
-                # Actually, main.py has the scanner. 
-                # Maybe we shouldn't run this inside RealtimeScanner but in main.py loop?
-                # But user asked for "real time scraping ensure...".
-                # Let's keep it here but keep it simple.
-                
-                # Fetch all contacts, enqueue them.
-                # ProcessingQueue dedupes based on content? No, based on ID?
-                # MessageScanner had _is_photo_processed.
-                # Let's verify _is_photo_processed in MessageScanner is static or instance? 
-                # Instance. 
-                
-                # For now, let's just log. Implementing full scan here duplicates logic.
-                # BETTER: Call the MessageScanner's method if we can.
-                # But we don't have ref to MessageScanner.
-                
-                # ALTERNATIVE: Just blindly enqueue. The DB dedupe will prevent re-processing.
-                # BUT downloading 1000 photos every hour is bad for bandwidth.
-                
-                # I'll rely on the manual orchestrator loop in main.py for heavy lifting?
-                # No, user wants realtime.
-                
-                # I'll do a specialized "check new contacts" here.
-                # Actually, let's just access the DB function directly.
-                pass 
+                         if hasattr(user.photo, 'photo_id'):
+                            pid = user.photo.photo_id
+                            # Check DB manually to avoid import cycle
+                            if not await self._check_if_user_processed(user.id, pid):
+                                try:
+                                    photo_bytes = await self.client.download_profile_photo(user, file=bytes)
+                                    if photo_bytes:
+                                        await self.processing_queue.enqueue_profile_photo(
+                                            user_id=user.id,
+                                            content=io.BytesIO(photo_bytes)
+                                        )
+                                        await self._mark_user_processed(user.id, pid)
+                                        new_count += 1
+                                except Exception as e:
+                                    logger.warning(f"Failed to download contact photo: {e}")
+                                    
+                if new_count > 0:
+                    logger.info(f"✅ Periodic contact scan: Found {new_count} new profile photos")
                 
                 # Implementation:
                 new_count = 0
