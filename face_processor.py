@@ -9,7 +9,12 @@ import asyncio
 import numpy as np
 import cv2
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor
+
+# Silence specific deprecation/future warnings from underlying libraries
+warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
+warnings.filterwarnings("ignore", category=FutureWarning, module="skimage")
 from typing import List, Dict, Optional
 from PIL import Image
 import io
