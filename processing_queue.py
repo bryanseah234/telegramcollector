@@ -191,7 +191,7 @@ class ProcessingQueue:
         
         # Task execution timeout (prevent stuck workers)
         # Use dynamic setting with a safe default
-        self.task_timeout_seconds = int(get_dynamic_setting("WORKER_TASK_TIMEOUT", 300))
+        self.task_timeout_seconds = int(get_dynamic_setting("WORKER_TASK_TIMEOUT", 600))
         
         # Worker memory limit (MB)
         # Worker memory limit (MB)
@@ -610,11 +610,7 @@ class ProcessingQueue:
                         self.record_processing_time(task.chat_id, duration)
                     
                     self.stats['processed'] += 1
-                except asyncio.TimeoutError:
-                    logger.critical(f"Worker {worker_id} timed out processing task! This indicates a stuck thread (e.g. CUDA).")
-                    logger.critical("❌ FORCING CONTAINER RESTART (sys.exit(1)) TO CLEAR STUCK STATE.")
-                    import sys
-                    sys.exit(1)
+                # (TimeoutError will be caught by generic Exception handler below and retried)
 
                 except asyncio.CancelledError:
                     break
