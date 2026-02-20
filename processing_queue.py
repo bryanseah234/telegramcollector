@@ -595,11 +595,23 @@ class ProcessingQueue:
                         }
                         
                         try:
-                            # Add timeout protection to prevent stuck workers
+                            # Add timeout protection to prevent stuck workers 
+                            # We shield the task so any DB operations inside can finish/rollback cleanly
+                            # instead of being brutally abandoned mid-transaction when cancelled
+                            task_future = asyncio.create_task(self._process_task(task, worker_id))
                             await asyncio.wait_for(
-                                self._process_task(task, worker_id),
+                                asyncio.shield(task_future),
                                 timeout=self.task_timeout_seconds
                             )
+                        except (asyncio.TimeoutError, TimeoutError):
+                            # Ensure the future is correctly cancelled
+                            if not task_future.done():
+                                task_future.cancel()
+                            raise  # Re-raise to be handled by the outer block
+                        except asyncio.CancelledError:
+                            if not task_future.done():
+                                task_future.cancel()
+                            raise
                         finally:
                             # Clear active task
                             if worker_id in self._active_tasks:

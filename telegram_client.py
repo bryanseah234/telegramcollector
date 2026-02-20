@@ -51,8 +51,14 @@ class TelegramClientManager:
         self._flood_wait_until = None
         
         # Ensure session directory exists
-        os.makedirs('sessions', exist_ok=True)
-        session_path = os.path.join('sessions', session_name)
+        sessions_dir = os.path.join(os.getcwd(), 'sessions')
+        os.makedirs(sessions_dir, exist_ok=True)
+        
+        # Prevent duplication if session_name already contains 'sessions/'
+        if 'sessions' in session_name.split(os.sep):
+            session_name = os.path.basename(session_name)
+            
+        session_path = os.path.join(sessions_dir, session_name)
         
         logger.debug(f"Initializing client with session path: {os.path.abspath(session_path)}")
         

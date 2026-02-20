@@ -809,6 +809,14 @@ def main():
             loop.run_until_complete(worker.shutdown())
             break  # Don't restart on user interrupt
             
+        except asyncio.CancelledError:
+            logger.info("Worker task cancelled (likely during shutdown). Exiting cleanly.")
+            try:
+                loop.run_until_complete(worker.shutdown())
+            except Exception:
+                pass
+            break
+            
         except Exception as e:
             restart_count += 1
             delay = BASE_RESTART_DELAY * (2 ** (restart_count - 1))  # Exponential backoff
