@@ -610,10 +610,36 @@ class ProcessingQueue:
                         self.record_processing_time(task.chat_id, duration)
                     
                     self.stats['processed'] += 1
-                # (TimeoutError will be caught by generic Exception handler below and retried)
-
                 except asyncio.CancelledError:
                     break
+
+                except (asyncio.TimeoutError, TimeoutError):
+                    logger.error(f"Worker {worker_id} TIMED OUT processing task (Chat {task.chat_id}). This usually indicates a stuck network request.")
+                    self.stats['errors'] += 1
+                    
+                    # RETRY LOGIC
+                    current_retries = task_data.get('_retry_count', 0)
+                    if current_retries < self.max_task_retries:
+                        logger.warning(f"Retrying task (attempt {current_retries + 1}/{self.max_task_retries})...")
+                        task_data['_retry_count'] = current_retries + 1
+                        
+                        # Re-enqueue
+                        if self.redis_available:
+                            try:
+                                await loop.run_in_executor(
+                                    None, 
+                                    self.redis_client.rpush, 
+                                    self.queue_key, 
+                                    json.dumps(task_data)
+                                )
+                            except:
+                                await self.fallback_queue.put(json.dumps(task_data))
+                        else:
+                            await self.fallback_queue.put(json.dumps(task_data))
+                    else:
+                        logger.error(f"Task failed after {self.max_task_retries} retries. Moving to DLQ.")
+                        await self._move_to_dead_letter(task_data, "Task Timed Out repeatedly")
+                    continue
 
                 except Exception as e:
                     # Check for FloodWaitError dynamically to avoid import issues

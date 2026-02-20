@@ -147,6 +147,8 @@ class DatabaseManager:
         if self.pool:
             try:
                 await self.pool.close()
+            except asyncio.CancelledError:
+                logger.info("Database pool close was cancelled (expected during shutdown)")
             except Exception as e:
                 logger.error(f"Error closing DB pool: {e}")
             finally:

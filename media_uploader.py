@@ -155,9 +155,13 @@ class MediaUploader:
                 filename = f"media_{source_chat_id}_{source_message_id}{ext}"
                 
                 # Upload the file with proper filename
-                uploaded_file = await client.upload_file(
-                    media_buffer,
-                    file_name=filename
+                # Wrap in wait_for to prevent silent network stalls from freezing the worker
+                uploaded_file = await asyncio.wait_for(
+                    client.upload_file(
+                        media_buffer,
+                        file_name=filename
+                    ),
+                    timeout=120.0  # 2 minutes maximum for upload
                 )
                 
                 # Prepare send_file kwargs based on media type
@@ -209,6 +213,14 @@ class MediaUploader:
                 logger.warning(f"FloodWait during upload. Waiting {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 # Don't count this as an attempt
+                continue
+                
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                delay = self.base_retry_delay * (2 ** attempt)
+                logger.warning(f"Upload timed out (attempt {attempt + 1}/{self.max_retries}). The server connection might have dropped.")
+                
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(delay)
                 continue
                 
             except Exception as e:
