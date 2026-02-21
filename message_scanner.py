@@ -47,26 +47,27 @@ class MessageScanner:
             logger.info(f"Found {total_contacts} contacts to scan")
             
             for user in contacts:
-                if isinstance(user, User) and user.photo:
-                    current_photo_id = getattr(user.photo, 'photo_id', 0)
-                    
-                    # Check if this specific photo_id has been processed
-                    if not await self._is_photo_processed(user.id, current_photo_id):
-                        logger.debug(f"Fetching profile photo for contact {user.id} ({user.first_name})")
-                        
-                        try:
-                            # Download max size
-                            photo_bytes = await self.client.download_profile_photo(user, file=bytes)
-                            
-                            if photo_bytes:
-                                await self.processing_queue.enqueue_profile_photo(
-                                    user_id=user.id,
-                                    content=io.BytesIO(photo_bytes)
-                                )
-                                await self._mark_user_processed(user.id, current_photo_id)
-                                new_photos += 1
-                        except Exception as e:
-                            logger.error(f"Failed to download photo for contact {user.id}: {e}")
+                if isinstance(user, User):
+                    try:
+                        async for photo in self.client.iter_profile_photos(user):
+                            photo_id = getattr(photo, 'id', 0)
+                            if not photo_id:
+                                continue
+                                
+                            if not await self._is_historical_photo_processed(user.id, photo_id):
+                                logger.debug(f"Fetching historical profile photo {photo_id} for contact {user.id} ({user.first_name})")
+                                
+                                photo_bytes = await self.media_manager.download_specific_profile_photo(user, photo)
+                                
+                                if photo_bytes:
+                                    await self.processing_queue.enqueue_profile_photo(
+                                        user_id=user.id,
+                                        content=io.BytesIO(photo_bytes)
+                                    )
+                                    await self._mark_historical_photo_processed(user.id, photo_id)
+                                    new_photos += 1
+                    except Exception as e:
+                        logger.error(f"Failed to process photos for contact {user.id}: {e}")
                             
                     count += 1
                     if count % 50 == 0:
@@ -277,23 +278,23 @@ class MessageScanner:
                 logger.warning(f"Failed to download media from message {message.id}: {e}")
 
         # 2. Process Sender Profile Photo (Feature: profile photo scraping)
-        # Compares photo_id to detect when user changes their profile photo
+        # Scrape all historical profile photos for the user
         try:
             sender = await message.get_sender()
-            if sender and isinstance(sender, User) and sender.photo:
-                current_photo_id = getattr(sender.photo, 'photo_id', 0)
-                
-                # Check if this specific photo_id has been processed
-                # If user changed photo (new photo_id), we'll process it again
-                if not await self._is_photo_processed(sender.id, current_photo_id):
-                    logger.debug(f"Fetching profile photo for user {sender.id} (photo_id: {current_photo_id})")
-                    photo_bytes = await self.client.download_profile_photo(sender, file=bytes)
-                    if photo_bytes:
-                        await self.processing_queue.enqueue_profile_photo(
-                            user_id=sender.id,
-                            content=io.BytesIO(photo_bytes)
-                        )
-                        await self._mark_user_processed(sender.id, current_photo_id)
+            if sender and isinstance(sender, User):
+                async for photo in self.client.iter_profile_photos(sender):
+                    photo_id = getattr(photo, 'id', 0)
+                    if not photo_id: continue
+                    
+                    if not await self._is_historical_photo_processed(sender.id, photo_id):
+                        logger.debug(f"Fetching historical profile photo {photo_id} for user {sender.id}")
+                        photo_bytes = await self.media_manager.download_specific_profile_photo(sender, photo)
+                        if photo_bytes:
+                            await self.processing_queue.enqueue_profile_photo(
+                                user_id=sender.id,
+                                content=io.BytesIO(photo_bytes)
+                            )
+                            await self._mark_historical_photo_processed(sender.id, photo_id)
         except Exception as e:
             logger.debug(f"Could not process profile photo for message {message.id}: {e}")
 
@@ -368,36 +369,29 @@ class MessageScanner:
         except Exception:
             return 0
 
-    async def _is_photo_processed(self, user_id: int, photo_id: int) -> bool:
+    async def _is_historical_photo_processed(self, user_id: int, photo_id: int) -> bool:
         """
-        Checks if a user's specific photo_id has been processed.
+        Checks if a user's specific historical photo_id has been processed.
         """
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    SELECT photo_id FROM processed_users WHERE user_id = %s
-                """, (user_id,))
+                    SELECT photo_id FROM processed_profile_photos 
+                    WHERE user_id = %s AND photo_id = %s
+                """, (user_id, photo_id))
                 row = await cur.fetchone()
-                
-                if row is None:
-                    return False  # Never seen this user
-                
-                # Compare stored photo_id with current one
-                stored_photo_id = row[0]
-                return stored_photo_id == photo_id
+                return row is not None
 
-    async def _mark_user_processed(self, user_id: int, photo_id: int):
+    async def _mark_historical_photo_processed(self, user_id: int, photo_id: int):
         """
-        Records that a user's profile photo (identified by photo_id) has been processed.
+        Records that a user's specific historical photo has been processed.
         """
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    INSERT INTO processed_users (user_id, photo_id, last_scan) 
+                    INSERT INTO processed_profile_photos (user_id, photo_id, processed_at) 
                     VALUES (%s, %s, NOW())
-                    ON CONFLICT (user_id) DO UPDATE SET 
-                        photo_id = EXCLUDED.photo_id,
-                        last_scan = NOW()
+                    ON CONFLICT (user_id, photo_id) DO NOTHING
                 """, (user_id, photo_id))
     
     def _get_file_unique_id(self, message) -> str:
@@ -518,15 +512,24 @@ class RealtimeScanner:
                 logger.info(f"👥 Users joined/added to chat {chat_id}: {[u.id for u in users]}")
                 
                 for user in users:
-                    if isinstance(user, User) and user.photo:
-                        logger.info(f"  → Fetching profile photo for new member {user.id}")
-                        photo_bytes = await self.client.download_profile_photo(user, file=bytes)
-                        
-                        if photo_bytes:
-                            await self.processing_queue.enqueue_profile_photo(
-                                user_id=user.id,
-                                content=io.BytesIO(photo_bytes)
-                            )
+                    if isinstance(user, User):
+                        logger.info(f"  → Fetching profile photos for new member {user.id}")
+                        try:
+                            async for photo in self.client.iter_profile_photos(user):
+                                photo_id = getattr(photo, 'id', 0)
+                                if not photo_id: continue
+                                
+                                if not await self._is_historical_photo_processed(user.id, photo_id):
+                                    photo_bytes = await self.media_manager.download_specific_profile_photo(user, photo)
+                                    
+                                    if photo_bytes:
+                                        await self.processing_queue.enqueue_profile_photo(
+                                            user_id=user.id,
+                                            content=io.BytesIO(photo_bytes)
+                                        )
+                                        await self._mark_historical_photo_processed(user.id, photo_id)
+                        except Exception as e:
+                            logger.error(f"Failed to fetch photos for new member {user.id}: {e}")
         except Exception as e:
             logger.error(f"Error processing chat action: {e}")
 
@@ -544,61 +547,46 @@ class RealtimeScanner:
                 new_count = 0
                 
                 for user in contacts:
-                    if isinstance(user, User) and user.photo:
-                         if hasattr(user.photo, 'photo_id'):
-                            pid = user.photo.photo_id
-                            # Check DB manually to avoid import cycle
-                            if not await self._check_if_user_processed(user.id, pid):
-                                try:
-                                    photo_bytes = await self.client.download_profile_photo(user, file=bytes)
+                    if isinstance(user, User):
+                        try:
+                            async for photo in self.client.iter_profile_photos(user):
+                                pid = getattr(photo, 'id', 0)
+                                if not pid: continue
+                                
+                                if not await self._check_if_historical_photo_processed(user.id, pid):
+                                    photo_bytes = await self.media_manager.download_specific_profile_photo(user, photo)
                                     if photo_bytes:
                                         await self.processing_queue.enqueue_profile_photo(
                                             user_id=user.id,
                                             content=io.BytesIO(photo_bytes)
                                         )
-                                        await self._mark_user_processed(user.id, pid)
+                                        await self._mark_historical_photo_processed(user.id, pid)
                                         new_count += 1
-                                except Exception as e:
-                                    logger.warning(f"Failed to download contact photo: {e}")
+                        except Exception as e:
+                            logger.warning(f"Failed to download contact photo: {e}")
                                     
-                if new_count > 0:
-                    logger.info(f"✅ Periodic contact scan: Found {new_count} new profile photos")
-                
-                # Implementation:
-                new_count = 0
-                for user in contacts:
-                    if user.photo and hasattr(user.photo, 'photo_id'):
-                        pid = user.photo.photo_id
-                        # Check DB
-                        if not await self._check_if_user_processed(user.id, pid):
-                            photo_bytes = await self.client.download_profile_photo(user, file=bytes)
-                            if photo_bytes:
-                                await self.processing_queue.enqueue_profile_photo(user.id, io.BytesIO(photo_bytes))
-                                await self._mark_user_processed(user.id, pid)
-                                new_count += 1
-                                
                 if new_count > 0:
                     logger.info(f"✅ Periodic contact scan: Found {new_count} new profile photos")
                     
             except Exception as e:
                 logger.error(f"Periodic contact scan failed: {e}")
 
-    async def _check_if_user_processed(self, user_id: int, photo_id: int) -> bool:
-        """Duplicated simple check to avoid import cycles."""
+    async def _check_if_historical_photo_processed(self, user_id: int, photo_id: int) -> bool:
+        """Checks if a user's historical photo has been processed."""
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT photo_id FROM processed_users WHERE user_id = %s", (user_id,))
+                await cur.execute("SELECT photo_id FROM processed_profile_photos WHERE user_id = %s AND photo_id = %s", (user_id, photo_id))
                 row = await cur.fetchone()
-                return row and row[0] == photo_id
+                return row is not None
 
-    async def _mark_user_processed(self, user_id: int, photo_id: int):
-        """Duplicated simple mark."""
+    async def _mark_historical_photo_processed(self, user_id: int, photo_id: int):
+        """Records that a user's historical photo has been processed."""
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
-                    INSERT INTO processed_users (user_id, photo_id, last_scan) 
+                    INSERT INTO processed_profile_photos (user_id, photo_id, processed_at) 
                     VALUES (%s, %s, NOW())
-                    ON CONFLICT (user_id) DO UPDATE SET photo_id = EXCLUDED.photo_id, last_scan = NOW()
+                    ON CONFLICT (user_id, photo_id) DO NOTHING
                 """, (user_id, photo_id))
     
     async def _update_realtime_checkpoint(self, chat_id: int, message_id: int):

@@ -134,6 +134,26 @@ class MediaDownloadManager:
             logger.warning(f"Failed to download profile photo for user {user.id}: {e}")
             return None
     
+    async def download_specific_profile_photo(self, user, photo) -> Optional[bytes]:
+        """
+        Downloads a specific historical profile photo of a user.
+        
+        Args:
+            user: Telethon User object
+            photo: Telethon Photo object representing one of the user's profile photos
+            
+        Returns:
+            Bytes of the photo, or None if failed
+        """
+        try:
+            photo_bytes = await self.client.download_media(photo, file=bytes)
+            if photo_bytes:
+                logger.debug(f"Downloaded specific profile photo for user {user.id}: {len(photo_bytes)} bytes")
+            return photo_bytes
+        except Exception as e:
+            logger.warning(f"Failed to download specific profile photo for user {user.id}: {e}")
+            return None
+    
     def get_media_type(self, message) -> str:
         """
         Determines the type of media in a message.

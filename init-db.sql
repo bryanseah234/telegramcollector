@@ -166,6 +166,20 @@ CREATE INDEX IF NOT EXISTS idx_processed_users_photo ON processed_users(photo_id
 CREATE INDEX IF NOT EXISTS idx_processed_users_topic ON processed_users(topic_id);
 
 -- ============================================
+-- Table: processed_profile_photos
+-- ============================================
+-- Tracks all historical profile photos for a user
+CREATE TABLE IF NOT EXISTS processed_profile_photos (
+    user_id BIGINT NOT NULL,
+    photo_id BIGINT NOT NULL,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, photo_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_profile_photos_user ON processed_profile_photos(user_id);
+
+
+-- ============================================
 -- Table: health_checks
 -- ============================================
 -- Stores periodic health check results for dashboard display

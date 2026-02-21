@@ -229,6 +229,18 @@ async def init_db():
             
             # Execute schema
             await conn.execute(schema)
+            
+            # Run migration for historical profile photos table to ensure it exists
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_profile_photos (
+                    user_id BIGINT NOT NULL,
+                    photo_id BIGINT NOT NULL,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, photo_id)
+                );
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_profile_photos_user ON processed_profile_photos(user_id);")
+            
             logger.info("Database schema initialized.")
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
