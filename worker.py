@@ -421,6 +421,9 @@ class MainWorker:
             # Start health check scheduler as background task
             health_task = asyncio.create_task(self._health_check_scheduler())
 
+            # Start account discovery background task
+            discovery_task = asyncio.create_task(self._account_discovery_loop(mode))
+
             # Start update handler
             from update_handler import setup_update_handler
             self.update_handler = setup_update_handler(self.shutdown)
@@ -437,6 +440,79 @@ class MainWorker:
             raise
         finally:
             await self.shutdown()
+            
+    async def _account_discovery_loop(self, mode: str):
+        """
+        Periodically checks the database for newly added Telegram accounts 
+        and initializes scanners for them without requiring a restart.
+        """
+        logger.info("Account discovery loop started.")
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait 60 seconds between checks, break if shutdown
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=60.0)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                # Pre-check database for active accounts
+                from database import get_db_connection
+                async with get_db_connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT id, phone_number, session_file_path FROM telegram_accounts WHERE status = 'active'")
+                        rows = await cur.fetchall()
+
+                # Find accounts that are not currently in self.clients
+                new_accounts = []
+                for account_id, phone, session_path in rows:
+                    if account_id not in self.clients:
+                        new_accounts.append((account_id, phone, session_path))
+
+                for account_id, phone, session_path in new_accounts:
+                    if self._shutdown_event.is_set():
+                        break
+                        
+                    logger.info(f"🔍 Discovery: Found new active account {account_id} ({phone}). Connecting...")
+                    session_name = os.path.splitext(os.path.basename(session_path))[0]
+                    
+                    from telegram_client import TelegramClientManager
+                    from media_downloader import MediaDownloadManager
+                    from message_scanner import MessageScanner, RealtimeScanner
+                    
+                    manager = TelegramClientManager(session_name=session_name)
+                    try:
+                        await manager.start()
+                        self.clients[account_id] = manager
+                        
+                        media_downloader = MediaDownloadManager(manager.client)
+                        scanner = MessageScanner(
+                            client=manager.client,
+                            media_manager=media_downloader,
+                            processing_queue=self.processing_queue
+                        )
+                        rt_scanner = RealtimeScanner(
+                            client=manager.client,
+                            media_manager=media_downloader,
+                            processing_queue=self.processing_queue
+                        )
+                        self.scanners[account_id] = (scanner, rt_scanner)
+                        logger.info(f"✓ Account {account_id} dynamically connected and scanners ready")
+                        
+                        # Start backfill if applicable
+                        if mode in ('backfill', 'both'):
+                            asyncio.create_task(self._run_single_backfill(account_id))
+                        
+                        # Start realtime if applicable
+                        if mode in ('realtime', 'both'):
+                            asyncio.create_task(self._run_single_realtime(account_id))
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to connect new account {account_id} ({phone}): {e}")
+
+            except Exception as e:
+                logger.error(f"Account discovery loop error: {e}")
+                await asyncio.sleep(60)
     
     async def _health_check_scheduler(self):
         """

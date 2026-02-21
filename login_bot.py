@@ -72,6 +72,7 @@ class LoginState:
         self.phone = None
         self.client = None
         self.phone_code_hash = None
+        self.session_file_name = None
 
 
 async def schedule_delete(bot, chat_id, message_id, delay=AUTO_DELETE_SECONDS):
@@ -252,8 +253,11 @@ async def handle_phone(bot, event, session, phone):
     
     session.phone = clean_phone
     
-    # Create client for this user
-    session_file = os.path.join(SESSIONS_DIR, f"account_{phone.replace('+', '')}")
+    # Create client for this user with a unique session name
+    timestamp_suffix = int(time.time())
+    session_name = f"account_{phone.replace('+', '')}_{timestamp_suffix}"
+    session.session_file_name = session_name
+    session_file = os.path.join(SESSIONS_DIR, session_name)
     
     # Use lock to prevent concurrent SQLite access (Docker volumes can be slow)
     lock = get_session_lock(phone)
@@ -431,9 +435,15 @@ async def save_account(session, me):
     try:
         from database import get_db_connection
         
+        # Use the unique session name if available, fallback to phone
+        if hasattr(session, 'session_file_name') and session.session_file_name:
+            session_name = session.session_file_name
+        else:
+            session_name = f"account_{session.phone.replace('+', '')}"
+            
         session_path = os.path.join(
             SESSIONS_DIR,
-            f"account_{session.phone.replace('+', '')}.session"
+            f"{session_name}.session"
         )
         
         async with get_db_connection() as conn:
