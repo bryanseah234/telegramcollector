@@ -97,11 +97,12 @@ class TopicManager:
                 
                 # Verify we don't accidentally hit an existing one (unlikely but possible with random)
                 db_id = await self._save_topic_to_db(temp_topic_id_reservation, temp_label_reservation)
-                # 2. Determine final label (Backwards compatibility: if label provided, use it, else wait for ID)
-                # But per user request: "make it simple as possible... label same string as thread id"
-                # So we will update it AFTER we get the telegram_topic_id
+                # 2. Determine initial label
+                # We use the provided label if available, otherwise a placeholder.
+                # It will be updated to the Thread ID after creation.
+                initial_label = label if label else f"New Identity {db_id}"
                 
-                # 3. Create topic with FINAL name directly
+                # 3. Create topic
                 # Get the hub group entity
                 try:
                     hub = await client.get_input_entity(self.hub_group_id)
@@ -112,7 +113,7 @@ class TopicManager:
                 
                 result = await client(CreateForumTopicRequest(
                     channel=hub,
-                    title=final_label,
+                    title=initial_label,
                     icon_color=icon_color,
                     random_id=random.randint(1, 2**31 - 1)
                 ))
@@ -151,6 +152,19 @@ class TopicManager:
                             SET topic_id = %s, label = %s
                             WHERE id = %s
                         """, (telegram_topic_id, final_label, db_id))
+                
+                # 5. Optional: If we used an initial placeholder, rename it in Telegram now
+                if not label:
+                    try:
+                        from telethon.tl.functions.channels import EditForumTopicRequest
+                        await client(EditForumTopicRequest(
+                            channel=hub,
+                            topic_id=telegram_topic_id,
+                            title=final_label
+                        ))
+                        logger.info(f"✅ Renamed topic {telegram_topic_id} to match thread ID")
+                    except Exception as e:
+                        logger.warning(f"Failed to rename topic in Telegram (will be fixed on next repair): {e}")
 
                 logger.info(f"Created topic '{final_label}' (DB ID: {db_id}, Telegram ID: {telegram_topic_id})")
                 
