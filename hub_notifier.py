@@ -341,6 +341,20 @@ class HubNotifier:
                     logger.debug(f"Sent notification to Hub ({self._messages_sent_this_minute}/{self._rate_limit})")
                     return True
                 except Exception as e:
+                    # Specific handling for "Could not find the input entity" (PeerChannel error)
+                    if "input entity" in str(e).lower() or "peerchannel" in str(e).lower():
+                        logger.warning(f"Entity error sending to Hub, attempting to re-resolve: {e}")
+                        try:
+                            # Use get_entity to force a full resolution and cache the hash
+                            await client.get_entity(hub_id)
+                            # Retry sending
+                            await client.send_message(hub_id, message)
+                            self._messages_sent_this_minute += 1
+                            logger.info("Successfully sent notification after re-resolving Hub entity")
+                            return True
+                        except Exception as retry_e:
+                            logger.error(f"Failed again after retry: {retry_e}")
+                    
                     logger.warning(f"Failed to send to Hub (network error): {e}")
                     raise e
         except Exception as e:

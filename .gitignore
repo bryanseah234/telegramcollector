@@ -7,3 +7,4 @@ data/
 venv/
 .idea/
 .vscode/
+.sessions

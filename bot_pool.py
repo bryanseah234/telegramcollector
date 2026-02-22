@@ -118,6 +118,19 @@ class BotPool:
                 
                 logger.info(f"✓ Bot pool: Connected @{me.username} ({name})")
                 
+                # --- Bot Priming ---
+                # Fetch Hub Group entity immediately to cache access hash in session
+                # This prevents "Could not find the input entity" errors for Hub operations
+                hub_id = settings.HUB_GROUP_ID
+                if hub_id:
+                    try:
+                        logger.info(f"  → Priming Hub entity for @{me.username}...")
+                        await client.get_input_entity(hub_id)
+                        logger.info(f"  ✓ Hub entity primed for @{me.username}")
+                    except Exception as pe:
+                        logger.warning(f"  ⚠ Failed to prime Hub entity for @{me.username}: {pe}")
+                # ------------------
+                
             except Exception as e:
                 logger.error(f"✗ Bot pool: Failed to connect {name}: {e}")
                 entry.status = BotStatus.ERROR

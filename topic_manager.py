@@ -102,7 +102,12 @@ class TopicManager:
                 
                 # 3. Create topic with FINAL name directly
                 # Get the hub group entity
-                hub = await client.get_input_entity(self.hub_group_id)
+                try:
+                    hub = await client.get_input_entity(self.hub_group_id)
+                except (ValueError, Exception) as e:
+                    logger.warning(f"Failed to get input entity for Hub {self.hub_group_id}, attempting full resolution: {e}")
+                    # Force full resolution if input entity fails
+                    hub = await client.get_entity(self.hub_group_id)
                 
                 result = await client(CreateForumTopicRequest(
                     channel=hub,
@@ -164,8 +169,17 @@ class TopicManager:
                 
             except Exception as e:
                 logger.error(f"Failed to create topic: {e}")
-                # If we reserved an ID but failed, it stays as "Reserved_Topic" with ID 0
-                # This is a minor junk data issue, acceptable trade-off for speed
+                
+                # Cleanup: If we failed to create the Telegram topic, 
+                # delete the "Reserved_Topic" entry from DB to prevent junk buildup
+                try:
+                    async with get_db_connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute("DELETE FROM telegram_topics WHERE id = %s", (db_id,))
+                    logger.info(f"Cleaned up reserved DB ID {db_id} after failure")
+                except Exception as cleanup_e:
+                    logger.debug(f"Failed to cleanup DB ID {db_id}: {cleanup_e}")
+                
                 raise
         
         raise RuntimeError(f"Failed to create topic after {max_retries} retries")
@@ -194,7 +208,11 @@ class TopicManager:
             telegram_topic_id = topic_info['telegram_topic_id']
             
             # Get hub entity
-            hub = await client.get_input_entity(self.hub_group_id)
+            try:
+                hub = await client.get_input_entity(self.hub_group_id)
+            except (ValueError, Exception) as e:
+                logger.warning(f"Failed to get input entity for Hub on rename, attempting full resolution: {e}")
+                hub = await client.get_entity(self.hub_group_id)
             
             # Rename in Telegram (with FloodWait handling)
             try:
