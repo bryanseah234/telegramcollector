@@ -10,6 +10,7 @@ import asyncio
 import os
 import random
 import uuid
+from datetime import datetime, timedelta, timezone
 from database import get_db_connection
 from resilience import CircuitOpenError
 
@@ -96,9 +97,9 @@ class TopicManager:
                 
                 # Verify we don't accidentally hit an existing one (unlikely but possible with random)
                 db_id = await self._save_topic_to_db(temp_topic_id_reservation, temp_label_reservation)
-                
-                # 2. Determine final label
-                final_label = label if label else f"Person {db_id}"
+                # 2. Determine final label (Backwards compatibility: if label provided, use it, else wait for ID)
+                # But per user request: "make it simple as possible... label same string as thread id"
+                # So we will update it AFTER we get the telegram_topic_id
                 
                 # 3. Create topic with FINAL name directly
                 # Get the hub group entity
@@ -140,6 +141,9 @@ class TopicManager:
                     raise RuntimeError("Could not extract topic ID")
                 
                 # 4. Update the DB entry with the real Telegram Topic ID and Label
+                # Per user request: Label = Thread ID
+                final_label = label if label else str(telegram_topic_id)
+                
                 async with get_db_connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("""
@@ -339,3 +343,143 @@ class TopicManager:
                     SET face_count = face_count + 1
                     WHERE id = %s
                 """, (db_topic_id,))
+    
+    async def cleanup_topic(self, telegram_topic_id: int, retention_hours: int = 12, client=None):
+        """
+        Deletes messages in a topic older than retention_hours.
+        
+        Args:
+            telegram_topic_id: The Telegram ID of the topic (thread_id)
+            retention_hours: Delete messages older than this
+            client: Optional client to use (defaults to bot client)
+        """
+        if client is None:
+            client = await self._get_client()
+            
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+        
+        logger.info(f"🧹 Periodic Cleanup: Checking topic {telegram_topic_id} for messages older than {retention_hours}h (cutoff: {cutoff})")
+        
+        try:
+            hub_entity = await client.get_input_entity(self.hub_group_id)
+            
+            # Fetch messages from the topic
+            # Note: reply_to is the thread_id in Telegram API
+            messages_to_delete = []
+            async for message in client.iter_messages(hub_entity, reply_to=telegram_topic_id):
+                if message.date < cutoff:
+                    # Don't delete the service message that created the topic if possible
+                    # (Though in "General" there isn't one specific creation message like other topics)
+                    messages_to_delete.append(message.id)
+                
+                # Batch deletion to avoid flood
+                if len(messages_to_delete) >= 100:
+                    await client.delete_messages(hub_entity, messages_to_delete)
+                    logger.info(f"  🗑️ Deleted {len(messages_to_delete)} old messages from topic {telegram_topic_id}")
+                    messages_to_delete = []
+                    await asyncio.sleep(1) # Be gentle
+            
+            # Delete remaining
+            if messages_to_delete:
+                await client.delete_messages(hub_entity, messages_to_delete)
+                logger.info(f"  🗑️ Deleted {len(messages_to_delete)} old messages from topic {telegram_topic_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cleanup topic {telegram_topic_id}: {e}")
+            return False
+
+    async def ensure_all_topics_exist(self, client=None):
+        """
+        Scans all topics in DB and ensures they exist in Telegram.
+        If a topic is missing (deleted in Telegram), it recreates it.
+        """
+        if client is None:
+            client = await self._get_client()
+            
+        logger.info("🔬 Topic Repair: Checking Hub for missing topics...")
+        
+        try:
+            hub_entity = await client.get_input_entity(self.hub_group_id)
+            
+            # Get all topics from DB
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, topic_id, label FROM telegram_topics WHERE topic_id > 1")
+                    db_topics = await cur.fetchall()
+            
+            if not db_topics:
+                return
+                
+            repair_count = 0
+            for db_id, telegram_id, label in db_topics:
+                try:
+                    # Check if topic exists by trying to get messages from it
+                    # (Cheapest way to verify existence and bot access)
+                    await client.get_messages(hub_entity, limit=1, reply_to=telegram_id)
+                except Exception as e:
+                    # If error is about missing topic or restricted access
+                    if "not found" in str(e).lower() or "reference" in str(e).lower():
+                        logger.warning(f"  Topic {telegram_id} ('{label}') missing or unreachable. Recreating...")
+                        
+                        # Recreate
+                        icon_color = random.choice(TOPIC_ICON_COLORS)
+                        result = await client(CreateForumTopicRequest(
+                            channel=hub_entity,
+                            title=label, # Keep existing label (which might be the ID)
+                            icon_color=icon_color,
+                            random_id=random.randint(1, 2**31 - 1)
+                        ))
+                        
+                        # Extract new ID
+                        new_id = None
+                        if hasattr(result, 'updates'):
+                            for update in result.updates:
+                                if hasattr(update, 'id'):
+                                    new_id = update.id
+                                    break
+                                    
+                        if new_id:
+                            # Update DB
+                            async with get_db_connection() as conn:
+                                async with conn.cursor() as cur:
+                                    # Update mapping and set label to new ID if it was numeric-looking
+                                    new_label = str(new_id) if label.isdigit() else label
+                                    await cur.execute("""
+                                        UPDATE telegram_topics 
+                                        SET topic_id = %s, label = %s, updated_at = NOW()
+                                        WHERE id = %s
+                                    """, (new_id, new_label, db_id))
+                                    
+                                    # Update embeddings that point to this topic_id (DB ID remains same)
+                                    # No action needed for embeddings as they use FK to telegram_topics.id
+                                    
+                            logger.info(f"  ✅ Recreated topic {telegram_id} → {new_id}")
+                            repair_count += 1
+                        
+            if repair_count > 0:
+                logger.info(f"🔧 Topic Repair: Recreated {repair_count} missing topics")
+            else:
+                logger.info("✓ Topic Repair: All topics verified")
+                
+        except Exception as e:
+            logger.error(f"Topic repair failed: {e}")
+
+    async def migrate_labels_to_ids(self):
+        """
+        One-time migration to set all topic labels to their Telegram Thread IDs.
+        Makes identifying topics in Telegram easier.
+        """
+        logger.info("🚀 Migrating topic labels to match Thread IDs...")
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        UPDATE telegram_topics 
+                        SET label = topic_id::text
+                        WHERE label LIKE 'Person %' OR label = 'Unknown Person'
+                    """)
+                    count = cur.rowcount
+            logger.info(f"✅ Migrated {count} topic labels")
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")

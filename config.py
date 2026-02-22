@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     NOTIFY_ON_SCAN_MILESTONE: bool = True
     NOTIFY_MILESTONE_INTERVAL: int = 500  # Messages between milestones
     
+    # Cleanup Configuration
+    CLEANUP_INTERVAL: int = 3600             # 1 hour
+    GENERAL_TOPIC_RETENTION_HOURS: int = 12   # Auto-delete after 12h
+    
     # Observability
     ENABLE_PROMETHEUS: bool = True
     PROMETHEUS_PORT: int = 8000

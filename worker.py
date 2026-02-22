@@ -552,6 +552,12 @@ class MainWorker:
             self.update_handler = setup_update_handler(self.shutdown)
             await self.update_handler.start()
             
+            # Start topic cleanup scheduler
+            cleanup_task = asyncio.create_task(self._cleanup_scheduler())
+            
+            # Run one-time topic label migration
+            await self.topic_manager.migrate_labels_to_ids()
+            
             if mode in ('backfill', 'both'):
                 await self.run_backfill()
             
@@ -866,6 +872,54 @@ class MainWorker:
                     logger.info("✅ Hub Notifier self-healed")
         except Exception as e:
             logger.error(f"Failed to self-heal HubNotifier: {e}")
+
+    async def _cleanup_scheduler(self):
+        """
+        Periodically cleans up old messages in the General topic.
+        Runs every CLEANUP_INTERVAL seconds.
+        """
+        interval = settings.CLEANUP_INTERVAL
+        retention = settings.GENERAL_TOPIC_RETENTION_HOURS
+        
+        logger.info(f"Cleanup scheduler started (interval: {interval}s, retention: {retention}h)")
+        
+        # Initial wait to let system stabilize
+        await asyncio.sleep(60)
+        
+        while not self._shutdown_event.is_set():
+            try:
+                # 1. Pick a user client for cleanup (bots are restricted for GetReplies)
+                cleanup_client = None
+                if self.clients:
+                    # Get the first available healthy user client
+                    for manager in self.clients.values():
+                        if manager.client and await manager.client.is_user_authorized():
+                            cleanup_client = manager.client
+                            break
+                
+                if not cleanup_client:
+                    logger.warning("No authorized user client available for topic cleanup. Falling back to bot (may fail).")
+                
+                # 2. Cleanup General Topic (Thread ID 1)
+                await self.topic_manager.cleanup_topic(
+                    telegram_topic_id=1, 
+                    retention_hours=retention,
+                    client=cleanup_client
+                )
+                
+                # 3. Topic Repair (Self-healing)
+                await self.topic_manager.ensure_all_topics_exist(client=cleanup_client)
+                
+                # Wait for the interval or shutdown
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    pass  # Time to run again
+                
+            except Exception as e:
+                logger.error(f"Cleanup scheduler error: {e}")
+                await asyncio.sleep(60)
 
     async def _recover_telegram(self):
         """Attempts to recover Telegram connections."""
