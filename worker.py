@@ -193,8 +193,116 @@ class MainWorker:
 
         logger.info(f"✓ All {len(self.clients)} accounts initialized successfully!")
         
+        # Failsafe: Ensure bots are in the Hub group
+        await self._ensure_bots_in_hub()
+        
         # Log status to Hub Group
         await self.log_startup_status()
+
+    async def _ensure_bots_in_hub(self):
+        """
+        Failsafe: Checks if bots are members of the Hub group.
+        If not, uses a logged-in user account (that is an admin in the Hub)
+        to invite them automatically.
+        """
+        from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantRequest
+        from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
+        from telethon.errors import (
+            UserAlreadyParticipantError, ChatAdminRequiredError,
+            UserPrivacyRestrictedError, FloodWaitError,
+            UserNotMutualContactError, UserBotError
+        )
+        from bot_pool import bot_pool
+        
+        hub_id = settings.HUB_GROUP_ID
+        if not hub_id:
+            return
+        
+        if not self.clients:
+            logger.debug("No user accounts connected, skipping bot invite check")
+            return
+        
+        logger.info("🔍 Checking if bots are in the Hub group...")
+        
+        # Step 1: Find a user account that is an admin in the Hub
+        admin_client = None
+        admin_account_id = None
+        
+        for account_id, manager in self.clients.items():
+            try:
+                client = manager.client
+                # Try to get the hub entity
+                hub = await client.get_entity(hub_id)
+                
+                # Check if this user is an admin
+                me = await client.get_me()
+                participant = await client(GetParticipantRequest(hub, me.id))
+                p = participant.participant
+                
+                if isinstance(p, (ChannelParticipantAdmin, ChannelParticipantCreator)):
+                    admin_client = client
+                    admin_account_id = account_id
+                    logger.info(f"✓ Account {account_id} is admin in Hub")
+                    break
+                else:
+                    logger.debug(f"Account {account_id} is in Hub but not admin")
+            except Exception as e:
+                logger.debug(f"Account {account_id} can't access Hub: {e}")
+                continue
+        
+        if not admin_client:
+            logger.warning("⚠️ No user accounts are admins in the Hub group. Bots must be added manually.")
+            return
+        
+        # Step 2: Check each bot and invite if missing
+        bot_tokens = settings.parsed_bot_tokens
+        invited_count = 0
+        
+        for bot_info in bot_tokens:
+            bot_name = bot_info['name']
+            bot_token = bot_info['token']
+            
+            try:
+                # Extract bot ID from token (format: "bot_id:secret")
+                bot_id = int(bot_token.split(':')[0])
+                
+                # Check if bot is already in the Hub
+                try:
+                    hub = await admin_client.get_entity(hub_id)
+                    await admin_client(GetParticipantRequest(hub, bot_id))
+                    logger.debug(f"Bot {bot_name} ({bot_id}) already in Hub ✓")
+                    continue
+                except Exception:
+                    # Bot not found in Hub — needs invite
+                    pass
+                
+                # Invite the bot
+                logger.info(f"📨 Inviting bot {bot_name} ({bot_id}) to Hub...")
+                try:
+                    bot_entity = await admin_client.get_entity(bot_id)
+                    hub = await admin_client.get_entity(hub_id)
+                    await admin_client(InviteToChannelRequest(hub, [bot_entity]))
+                    logger.info(f"✅ Bot {bot_name} invited to Hub successfully!")
+                    invited_count += 1
+                except UserAlreadyParticipantError:
+                    logger.debug(f"Bot {bot_name} already in Hub")
+                except (ChatAdminRequiredError, UserPrivacyRestrictedError) as e:
+                    logger.warning(f"⚠️ Can't invite {bot_name}: {e}")
+                except UserNotMutualContactError:
+                    logger.warning(f"⚠️ Can't invite {bot_name}: privacy settings prevent it")
+                except FloodWaitError as e:
+                    logger.warning(f"⏳ FloodWait inviting {bot_name}: {e.seconds}s")
+                    await asyncio.sleep(min(e.seconds, 30))
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Could not check/invite bot {bot_name}: {e}")
+        
+        if invited_count > 0:
+            logger.info(f"✅ Invited {invited_count} bot(s) to Hub group")
+            # Brief pause for Telegram to process the invites
+            await asyncio.sleep(2)
+        else:
+            logger.info("✓ All bots already in Hub group")
 
     async def log_startup_status(self):
         """Logs system startup status to the Hub Group."""
