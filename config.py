@@ -1,11 +1,12 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 
 class Settings(BaseSettings):
     # Telegram API
     TG_API_ID: int
     TG_API_HASH: str
     BOT_TOKEN: str
+    BOT_TOKENS: str = ""  # Semicolon-separated name:token pairs
     
     # Hub Configuration
     HUB_GROUP_ID: int
@@ -64,6 +65,28 @@ class Settings(BaseSettings):
     @property
     def TELEGRAM_API_HASH(self) -> str:
         return self.TG_API_HASH
+    
+    @property
+    def parsed_bot_tokens(self) -> List[Dict[str, str]]:
+        """Parses BOT_TOKENS into a list of {'name': ..., 'token': ...} dicts.
+        Falls back to BOT_TOKEN if BOT_TOKENS is empty."""
+        if self.BOT_TOKENS and self.BOT_TOKENS.strip():
+            result = []
+            for entry in self.BOT_TOKENS.split(';'):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                # Format: BotName:bot_id:bot_secret (name:token where token contains a colon)
+                parts = entry.split(':', 1)
+                if len(parts) == 2:
+                    result.append({'name': parts[0].strip(), 'token': parts[1].strip()})
+                else:
+                    # Just a raw token without name
+                    result.append({'name': f'bot_{len(result)+1}', 'token': entry})
+            if result:
+                return result
+        # Fallback to single BOT_TOKEN
+        return [{'name': 'default', 'token': self.BOT_TOKEN}]
     
     model_config = SettingsConfigDict(
         env_file=".env",

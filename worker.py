@@ -678,6 +678,20 @@ class MainWorker:
         except Exception:
             pass
         
+        # 9. Bot Pool Health
+        try:
+            from bot_pool import bot_pool
+            healthy = len(bot_pool.get_healthy_bots())
+            total = bot_pool.bot_count
+            if healthy < total:
+                locked = total - healthy
+                checks['Bot Pool'] = f'⚠️ {healthy}/{total} healthy ({locked} locked)'
+                warnings.append('Bot Pool')
+            else:
+                checks['Bot Pool'] = f'✅ {healthy}/{total} bots healthy'
+        except Exception as e:
+            checks['Bot Pool'] = f'❌ Error: {str(e)[:50]}'
+        
         # Build report
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
@@ -729,11 +743,18 @@ class MainWorker:
                 await manager.start()
     
     async def _recover_hub_access(self):
-        """Attempts to recover Hub access."""
-        logger.warning("Recovery: Checking Bot client...")
+        """Attempts to recover Hub access using bot pool rotation."""
+        logger.warning("Recovery: Checking Bot pool...")
         from bot_client import bot_client_manager
-        if not bot_client_manager.client or not bot_client_manager.client.is_connected():
-            logger.info("Reconnecting bot client...")
+        try:
+            # This will automatically pick a healthy bot from the pool
+            client = bot_client_manager.client
+            if not client or not client.is_connected():
+                logger.info("Reconnecting bot pool...")
+                await bot_client_manager.start()
+        except RuntimeError as e:
+            logger.error(f"No healthy bots available: {e}")
+            # Try to restart the bot pool
             await bot_client_manager.start()
     
     async def shutdown(self):
@@ -933,10 +954,12 @@ def main():
                 from hub_notifier import HubNotifier
                 from face_processor import FaceProcessor
                 from bot_client import bot_client_manager, BotClientManager
+                from bot_pool import BotPool
                 
                 HubNotifier.reset_instance()
                 FaceProcessor.reset_instance()
                 BotClientManager.reset_instance()
+                BotPool.reset_instance()
                 
                 # 3. Final loop drain to let library tasks (like Telethon loops) finish
                 tasks = asyncio.all_tasks(loop)

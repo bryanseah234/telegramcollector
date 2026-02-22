@@ -1,14 +1,13 @@
 """
-Bot Client - Singleton Telegram bot client for topic management and media publishing.
+Bot Client - Telegram bot client manager using the Bot Pool for rotation.
 
-Uses the BOT_TOKEN to authenticate as the bot (not user accounts).
+Uses the BotPool to transparently rotate between multiple bot credentials.
 User accounts are only used for scanning; the bot handles all publishing.
 """
 import os
 import asyncio
 import logging
 from dotenv import load_dotenv
-from telethon import TelegramClient
 
 load_dotenv()
 
@@ -16,26 +15,22 @@ logger = logging.getLogger(__name__)
 
 from config import settings
 
-# Configuration
-BOT_TOKEN = settings.BOT_TOKEN
-API_ID = settings.TG_API_ID
-API_HASH = settings.TG_API_HASH
-
 
 class BotClientManager:
     """
-    Singleton manager for the Telegram bot client.
+    Manager for the Telegram bot client with pool rotation.
     
     This bot is used for:
     - Creating forum topics in the hub group
     - Uploading media to topic threads
     - Managing topic metadata
+    - Bot commands (/status, /pause, etc.)
     
+    The pool transparently rotates between healthy bots.
     User sessions are only used for scanning chats.
     """
     
     _instance = None
-    _client = None
     _initialized = False
     
     def __new__(cls):
@@ -46,112 +41,104 @@ class BotClientManager:
     @classmethod
     def reset_instance(cls):
         """Resets the singleton instance (used for restarts)."""
-        if cls._instance:
-            if cls._instance._client and cls._instance._client.is_connected():
-                # We can't await here (sync method), but we assume disconnect() was called
-                pass
-            cls._instance = None
-            logger.info("BotClientManager singleton reset")
+        cls._instance = None
+        logger.info("BotClientManager singleton reset")
     
     @property
-    def client(self) -> TelegramClient:
-        """Returns the bot client."""
-        if self._client is None:
-            raise RuntimeError("Bot client not initialized. Call start() first.")
-        return self._client
+    def client(self):
+        """Returns a healthy bot client from the pool."""
+        from bot_pool import bot_pool
+        try:
+            bot_entry = bot_pool.get_bot()
+            return bot_entry.client
+        except RuntimeError:
+            raise RuntimeError("No healthy bots available. Check BotPool status.")
     
     async def start(self):
-        """Initializes and connects the bot client."""
+        """Initializes the bot pool with all configured tokens."""
         if self._initialized:
             return
         
-        if not BOT_TOKEN:
-            raise ValueError("BOT_TOKEN environment variable is required")
+        from bot_pool import bot_pool
         
-        if not API_ID or not API_HASH:
-            raise ValueError("TG_API_ID and TG_API_HASH environment variables are required")
+        bot_configs = settings.parsed_bot_tokens
+        if not bot_configs:
+            raise ValueError("No bot tokens configured. Set BOT_TOKEN or BOT_TOKENS in .env")
         
-        from telethon.errors import FloodWaitError
+        logger.info(f"Starting bot client manager with {len(bot_configs)} bot(s)...")
+        await bot_pool.initialize(bot_configs)
         
-        # Create bot client
-        session_name = os.getenv('BOT_SESSION_NAME', 'bot_publisher')
-        self._client = TelegramClient(session_name, API_ID, API_HASH)
-        
-        try:
-            await self._client.start(bot_token=BOT_TOKEN)
-            me = await self._client.get_me()
-            logger.info(f"Bot client connected: @{me.username}")
-            self._initialized = True
-            
-        except FloodWaitError as e:
-            wait_time = e.seconds
-            logger.warning(f"⏳ Bot hit rate limit. Waiting {wait_time}s ({wait_time//60}min) before retry...")
-            await asyncio.sleep(wait_time)
-            # Retry after waiting
-            await self._client.start(bot_token=BOT_TOKEN)
-            me = await self._client.get_me()
-            logger.info(f"Bot client connected after FloodWait: @{me.username}")
-            self._initialized = True
-            
-        except Exception as e:
-            logger.error(f"Failed to start bot client: {e}")
-            raise
+        self._initialized = True
+        logger.info(f"Bot client manager ready with {bot_pool.bot_count} bot(s)")
     
     async def disconnect(self):
-        """Disconnects the bot client."""
-        if self._client:
-            await self._client.disconnect()
-            self._initialized = False
-            logger.info("Bot client disconnected")
+        """Disconnects all bots in the pool."""
+        from bot_pool import bot_pool
+        await bot_pool.shutdown()
+        self._initialized = False
+        logger.info("Bot client manager disconnected")
     
     def is_ready(self) -> bool:
-        """Returns True if the bot client is connected and ready."""
-        return self._initialized and self._client and self._client.is_connected()
+        """Returns True if at least one bot is connected and healthy."""
+        if not self._initialized:
+            return False
+        from bot_pool import bot_pool
+        return len(bot_pool.get_healthy_bots()) > 0
 
     def register_worker(self, worker_instance):
-        """Registers the main worker instance to handle commands."""
-        if not self._client:
-            logger.error("Cannot register worker: Bot client not initialized")
+        """Registers the main worker instance to handle commands on ALL bots."""
+        from bot_pool import bot_pool
+        
+        if not bot_pool.bots:
+            logger.error("Cannot register worker: Bot pool not initialized")
             return
 
-        # Avoid circular imports
         import bot_commands
         from telethon import events
 
-        logger.info("Registering bot command handlers...")
+        logger.info(f"Registering bot command handlers on {len(bot_pool.bots)} bot(s)...")
 
-        @self._client.on(events.NewMessage(pattern='/status'))
-        async def status_handler(event):
-            await bot_commands.handle_status(event, worker_instance)
-
-        @self._client.on(events.NewMessage(pattern='/pause'))
-        async def pause_handler(event):
-            await bot_commands.handle_pause(event, worker_instance)
-
-        @self._client.on(events.NewMessage(pattern='/resume'))
-        async def resume_handler(event):
-            await bot_commands.handle_resume(event, worker_instance)
-
-        @self._client.on(events.NewMessage(pattern='/restart'))
-        async def restart_handler(event):
-            await bot_commands.handle_restart(event, worker_instance)
-        
-        @self._client.on(events.NewMessage(pattern=r'^/(commands|help)'))
-        async def help_handler(event):
-            await bot_commands.handle_help(event, worker_instance)
+        for bot_entry in bot_pool.bots:
+            if not bot_entry.client:
+                continue
             
-        logger.info("Bot commands registered successfully")
+            client = bot_entry.client
+            bot_name = bot_entry.name
+
+            @client.on(events.NewMessage(pattern='/status'))
+            async def status_handler(event, _name=bot_name):
+                await bot_commands.handle_status(event, worker_instance)
+
+            @client.on(events.NewMessage(pattern='/pause'))
+            async def pause_handler(event, _name=bot_name):
+                await bot_commands.handle_pause(event, worker_instance)
+
+            @client.on(events.NewMessage(pattern='/resume'))
+            async def resume_handler(event, _name=bot_name):
+                await bot_commands.handle_resume(event, worker_instance)
+
+            @client.on(events.NewMessage(pattern='/restart'))
+            async def restart_handler(event, _name=bot_name):
+                await bot_commands.handle_restart(event, worker_instance)
+            
+            @client.on(events.NewMessage(pattern=r'^/(commands|help)'))
+            async def help_handler(event, _name=bot_name):
+                await bot_commands.handle_help(event, worker_instance)
+            
+            logger.info(f"  ✓ Commands registered on @{bot_entry.username or bot_name}")
+        
+        logger.info("Bot commands registered on all bots")
 
 
 # Global singleton instance
 bot_client_manager = BotClientManager()
 
 
-async def get_bot_client() -> TelegramClient:
+async def get_bot_client():
     """
-    Returns the initialized bot client.
+    Returns a healthy bot client from the pool.
     
-    Raises RuntimeError if bot is not initialized.
+    Raises RuntimeError if no bots are available.
     Use bot_client_manager.start() first.
     """
     if not bot_client_manager.is_ready():
