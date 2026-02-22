@@ -7,6 +7,7 @@ services:
     image: pgvector/pgvector:pg16
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_db
     restart: unless-stopped
+    init: true
     environment:
       POSTGRES_DB: ${DB_NAME:-face_archiver}
       POSTGRES_USER: ${DB_USER:-postgres}
@@ -40,6 +41,7 @@ services:
     image: redis:alpine
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_redis
     restart: unless-stopped
+    init: true
     ports:
       - "6380:6379"
     volumes:
@@ -72,6 +74,7 @@ services:
       dockerfile: Dockerfile
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_app
     restart: unless-stopped
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,6 +133,7 @@ services:
       dockerfile: Dockerfile
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_login_bot
     restart: unless-stopped
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -165,6 +169,7 @@ services:
       dockerfile: Dockerfile
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_dashboard
     restart: unless-stopped
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -201,6 +206,7 @@ services:
     image: alpine:latest
     container_name: ${COMPOSE_PROJECT_NAME:-face_archiver}_updater
     restart: unless-stopped
+    init: true
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-}
       - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
