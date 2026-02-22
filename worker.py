@@ -34,6 +34,7 @@ class MainWorker:
         self.processing_queue = None
         self._shutdown_event = asyncio.Event()
         self._running = False
+        self.story_scanners: Dict[int, 'StoryScanner'] = {}  # account_id -> StoryScanner
 
     async def initialize(self):
         """Initializes all components in proper order."""
@@ -174,6 +175,17 @@ class MainWorker:
                 )
                 
                 self.scanners[account_id] = (scanner, rt_scanner)
+                
+                # Story Scanner (only user accounts can access stories)
+                if settings.STORY_SCAN_ENABLED:
+                    from story_scanner import StoryScanner
+                    story_scanner = StoryScanner(
+                        client=manager.client,
+                        processing_queue=self.processing_queue,
+                        media_manager=media_downloader
+                    )
+                    self.story_scanners[account_id] = story_scanner
+                
                 logger.info(f"✓ Account {account_id} connected and scanners ready")
                 
             except Exception as e:
@@ -404,14 +416,17 @@ class MainWorker:
         
         if chat_ids:
             logger.info(f"Account {account_id}: Monitoring {len(chat_ids)} chats")
-            # start_monitoring is usually non-blocking (sets up event handlers), 
-            # but if it blocks, this approach is fine as we use gather.
-            # However, looking at previous implementation, it sets up handlers.
-            # We just need to ensure we don't block here if start_monitoring blocks.
-            # Assuming start_monitoring just adds event handlers.
             await rt_scanner.start_monitoring(chat_ids, account_id)
         else:
             logger.warning(f"Account {account_id}: No chats found to monitor.")
+        
+        # Start story scanner polling (runs alongside realtime)
+        if account_id in self.story_scanners:
+            await self.story_scanners[account_id].start_polling(
+                account_id=account_id,
+                interval=settings.STORY_SCAN_INTERVAL
+            )
+            logger.info(f"✓ Story scanner started for account {account_id}")
     
     async def run(self, mode: str = 'both'):
         """Main run method."""
@@ -498,6 +513,16 @@ class MainWorker:
                         )
                         self.scanners[account_id] = (scanner, rt_scanner)
                         logger.info(f"✓ Account {account_id} dynamically connected and scanners ready")
+                        
+                        # Story Scanner for dynamically discovered account
+                        if settings.STORY_SCAN_ENABLED:
+                            from story_scanner import StoryScanner
+                            story_scanner = StoryScanner(
+                                client=manager.client,
+                                processing_queue=self.processing_queue,
+                                media_manager=media_downloader
+                            )
+                            self.story_scanners[account_id] = story_scanner
                         
                         # Start backfill if applicable
                         if mode in ('backfill', 'both'):
@@ -772,6 +797,14 @@ class MainWorker:
                 logger.info(f"Stopped realtime scanner for account {account_id}")
             except Exception as e:
                 logger.debug(f"Error stopping scanner: {e}")
+        
+        # 2b. Stop Story Scanners
+        for account_id, story_scanner in self.story_scanners.items():
+            try:
+                await story_scanner.stop()
+                logger.info(f"Stopped story scanner for account {account_id}")
+            except Exception as e:
+                logger.debug(f"Error stopping story scanner: {e}")
 
         # 3. Stop hub notifier (flushes pending events)
         if hasattr(self, 'hub_notifier'):

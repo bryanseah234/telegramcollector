@@ -180,6 +180,28 @@ CREATE INDEX IF NOT EXISTS idx_processed_profile_photos_user ON processed_profil
 
 
 -- ============================================
+-- Table: processed_stories
+-- ============================================
+-- Tracks Telegram Stories that have been scanned and processed
+-- Stories expire after 24 hours, but we keep records for dedup
+CREATE TABLE IF NOT EXISTS processed_stories (
+    id SERIAL PRIMARY KEY,
+    story_id BIGINT NOT NULL,
+    peer_id BIGINT NOT NULL,
+    account_id INTEGER REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+    media_type VARCHAR(20),                        -- 'photo' or 'video'
+    expire_date TIMESTAMP,                         -- When the story expires
+    faces_found INTEGER DEFAULT 0,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(story_id, peer_id, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stories_peer ON processed_stories(peer_id);
+CREATE INDEX IF NOT EXISTS idx_stories_account ON processed_stories(account_id);
+CREATE INDEX IF NOT EXISTS idx_stories_processed ON processed_stories(processed_at DESC);
+
+
+-- ============================================
 -- Table: health_checks
 -- ============================================
 -- Stores periodic health check results for dashboard display

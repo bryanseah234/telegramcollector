@@ -37,6 +37,7 @@ class TaskType(Enum):
     """Types of processing tasks."""
     MEDIA = 'media'
     PROFILE_PHOTO = 'profile_photo'
+    STORY = 'story'  # Telegram Stories (24h expiry - high priority)
 
 
 class BackpressureState(Enum):
@@ -331,6 +332,58 @@ class ProcessingQueue:
         
         self.check_backpressure()
         logger.debug(f"Enqueued profile photo for user {user_id}")
+    
+    async def enqueue_story(
+        self,
+        peer_id: int,
+        story_id: int,
+        content: io.BytesIO,
+        media_type: str = 'photo',
+        account_id: int = 0
+    ):
+        """Enqueues a story for face processing with elevated priority.
+        
+        Stories use LPUSH (left push) instead of RPUSH to jump ahead of
+        regular media in the queue, since they expire in 24 hours.
+        """
+        content.seek(0)
+        content_b64 = base64.b64encode(content.read()).decode('ascii')
+        
+        task_data = {
+            'task_type': TaskType.STORY.value,
+            'chat_id': peer_id,  # Use peer_id as chat_id for compatibility
+            'message_id': story_id,  # Use story_id as message_id for compatibility
+            'user_id': peer_id,
+            'content_b64': content_b64,
+            'media_type': media_type,
+            'metadata': {
+                'trace_id': self._get_trace_id(),
+                'source': 'story',
+                'account_id': account_id,
+                'story_id': story_id,
+                'peer_id': peer_id
+            }
+        }
+        
+        if self.redis_available:
+            loop = asyncio.get_event_loop()
+            try:
+                # LPUSH for priority: stories go to the FRONT of the queue
+                await loop.run_in_executor(
+                    None,
+                    self.redis_client.lpush,
+                    self.queue_key,
+                    json.dumps(task_data)
+                )
+            except Exception as e:
+                logger.error(f"Redis enqueue story failed: {e}. Switching to fallback.")
+                self.redis_available = False
+                await self.fallback_queue.put(json.dumps(task_data))
+        else:
+            await self.fallback_queue.put(json.dumps(task_data))
+        
+        self.check_backpressure()
+        logger.debug(f"Enqueued story {story_id} from peer {peer_id} (priority)")
     
     
     def check_backpressure(self):
@@ -944,6 +997,10 @@ class ProcessingQueue:
         
         if task.task_type == TaskType.PROFILE_PHOTO:
             await self._process_profile_photo(task)
+        elif task.task_type == TaskType.STORY:
+            # Stories use the same media pipeline but could have special handling
+            logger.debug(f"Processing story from peer {task.chat_id}")
+            await self._process_media(task)
         else:
             await self._process_media(task)
     

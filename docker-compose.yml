@@ -75,6 +75,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       - TG_API_ID=${TG_API_ID}
       - TG_API_HASH=${TG_API_HASH}
@@ -93,6 +95,10 @@ services:
       - RUN_MODE=${RUN_MODE:-both}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - BOT_TOKENS=${BOT_TOKENS}
+      - WORKER_TASK_TIMEOUT=${WORKER_TASK_TIMEOUT:-600}
+      - STORY_SCAN_INTERVAL=${STORY_SCAN_INTERVAL:-300}
+      - STORY_SCAN_ENABLED=${STORY_SCAN_ENABLED:-true}
     volumes:
       - .:/app
       - ./sessions:/app/sessions
@@ -132,6 +138,7 @@ services:
       - TG_API_ID=${TG_API_ID}
       - TG_API_HASH=${TG_API_HASH}
       - BOT_TOKEN=${BOT_TOKEN}
+      - BOT_TOKENS=${BOT_TOKENS}
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_NAME=${DB_NAME:-face_archiver}

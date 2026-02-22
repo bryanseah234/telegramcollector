@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     # Telegram API
     TG_API_ID: int
     TG_API_HASH: str
-    BOT_TOKEN: str
+    BOT_TOKEN: str = ""  # Optional if BOT_TOKENS is set
     BOT_TOKENS: str = ""  # Semicolon-separated name:token pairs
     
     # Hub Configuration
@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     HEALTH_CHECK_INTERVAL: int = 300
     LOGIN_BOT_ID: Optional[str] = None
     SESSIONS_DIR: str = "sessions"  # Directory for session files
+    
+    # Story Scanning
+    STORY_SCAN_INTERVAL: int = 300      # 5 minutes (stories expire in 24h)
+    STORY_SCAN_ENABLED: bool = True     # Can disable via env
+    STORY_PRIORITY_BOOST: int = 10      # Priority offset for story tasks
     
     # Resilience
     CIRCUIT_BREAKER_THRESHOLD: int = 5  # Failures before opening circuit
