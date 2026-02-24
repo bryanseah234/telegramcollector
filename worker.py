@@ -129,6 +129,19 @@ class MainWorker:
         # AUTO-DISCOVERY: Scan sessions directory and register any existing sessions
         await self._auto_discover_sessions()
 
+        # SELF-HEALING: Purge Hub Group from checkpoints to prevent infinite loops
+        try:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    hub_group_id = settings.HUB_GROUP_ID
+                    await cur.execute(
+                        "DELETE FROM scan_checkpoints WHERE chat_id IN (%s, %s)",
+                        (hub_group_id, -hub_group_id)
+                    )
+            logger.info("✓ Self-healing: Hub Group removed from scan checkpoints")
+        except Exception as e:
+            logger.warning(f"Failed to remove Hub Group from checkpoints: {e}")
+
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id, phone_number, session_file_path FROM telegram_accounts WHERE status = 'active'")
@@ -467,11 +480,14 @@ class MainWorker:
         
         # Resume incomplete chats - ORDERED BY PRIORITY (personal → group → channel)
         from database import get_db_connection
+        from config import settings
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
+                hub_group_id = settings.HUB_GROUP_ID
                 await cur.execute("""
                     SELECT chat_id, chat_type FROM scan_checkpoints 
                     WHERE account_id = %s AND scan_mode = 'backfill'
+                      AND chat_id NOT IN (%s, %s)
                     ORDER BY 
                         CASE chat_type 
                             WHEN 'personal' THEN 1 
@@ -479,7 +495,7 @@ class MainWorker:
                             WHEN 'channel' THEN 3 
                             ELSE 4 
                         END
-                """, (account_id,))
+                """, (account_id, hub_group_id, -hub_group_id))
                 chats = await cur.fetchall()
         
         logger.info(f"Account {account_id}: Scanning {len(chats)} chats in priority order (personal → group → channel)")
@@ -516,9 +532,14 @@ class MainWorker:
         
         # Get chats to monitor
         from database import get_db_connection
+        from config import settings
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT chat_id FROM scan_checkpoints WHERE account_id = %s", (account_id,))
+                hub_group_id = settings.HUB_GROUP_ID
+                await cur.execute(
+                    "SELECT chat_id FROM scan_checkpoints WHERE account_id = %s AND chat_id NOT IN (%s, %s)", 
+                    (account_id, hub_group_id, -hub_group_id)
+                )
                 rows = await cur.fetchall()
                 chat_ids = [row[0] for row in rows]
         

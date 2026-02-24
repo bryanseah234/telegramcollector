@@ -450,17 +450,26 @@ class RealtimeScanner:
         Begins real-time monitoring of specified chats.
         Registers event handlers that trigger when new messages arrive.
         """
-        self.monitored_chats = set(chat_ids)
+        # Filter out the Hub Group to prevent infinite scraping loops
+        from config import settings
+        hub_group_id = settings.HUB_GROUP_ID
+        
+        filtered_chat_ids = [
+            cid for cid in chat_ids
+            if cid != hub_group_id and cid != -hub_group_id and abs(cid) != abs(hub_group_id)
+        ]
+        
+        self.monitored_chats = set(filtered_chat_ids)
         self._account_id = account_id
         
         if not self._handler_added:
             # 1. New Message Handler
-            @self.client.on(events.NewMessage(chats=list(chat_ids) if chat_ids else None))
+            @self.client.on(events.NewMessage(chats=list(filtered_chat_ids) if filtered_chat_ids else None))
             async def handle_new_message(event):
                 await self._process_new_message(event)
             
             # 2. Chat Action Handler (User Joins)
-            @self.client.on(events.ChatAction(chats=list(chat_ids) if chat_ids else None))
+            @self.client.on(events.ChatAction(chats=list(filtered_chat_ids) if filtered_chat_ids else None))
             async def handle_chat_action(event):
                 await self._process_chat_action(event)
                 
@@ -476,6 +485,12 @@ class RealtimeScanner:
         """Handles incoming messages from monitored chats."""
         message = event.message
         chat_id = event.chat_id
+        
+        # Failsafe: Ignore Hub Group to prevent infinite scraping loops
+        from config import settings
+        hub_group_id = settings.HUB_GROUP_ID
+        if chat_id == hub_group_id or chat_id == -hub_group_id or abs(chat_id) == abs(hub_group_id):
+            return
         
         # Check if message contains processable media
         if not (message.photo or message.video):
@@ -505,6 +520,14 @@ class RealtimeScanner:
             
     async def _process_chat_action(self, event):
         """Handles user joins/adds to scan their profile photos immediately."""
+        # Failsafe: Ignore Hub Group
+        from config import settings
+        hub_group_id = settings.HUB_GROUP_ID
+        if getattr(event, 'chat_id', None):
+            chat_id = event.chat_id
+            if chat_id == hub_group_id or chat_id == -hub_group_id or abs(chat_id) == abs(hub_group_id):
+                return
+                
         try:
             if event.user_joined or event.user_added:
                 users = await event.get_users()
